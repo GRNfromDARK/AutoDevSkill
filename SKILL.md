@@ -1,0 +1,944 @@
+---
+name: autodev-generator
+description: Use when user says "帮我生成 autodev", "create autodev for", "generate autodev pipeline", or needs to turn a todolist.md into an automated gated TDD development pipeline.
+---
+
+# Autodev Pipeline Generator
+
+## Overview
+
+This skill generates a complete **Autodev automated development pipeline** from a structured todolist.md file. The output is a self-contained directory that runs `autodev.sh` to drive Claude Code through a gated, TDD-enforced, card-by-card development workflow — fully automated, no human in the loop.
+
+**Trigger phrases**: "帮我生成 xxx 的 autodev 文件", "create autodev for", "generate autodev pipeline"
+
+## What is Autodev?
+
+Autodev is a **spec-anchored, gate-guarded, TDD-enforced automated development methodology**. It:
+
+1. Splits a task list into sequential **Task Cards** (one AI session per card)
+2. Enforces **TDD 5-step closure** per card (RED → GREEN → SPEC → LINT → GATE)
+3. Runs **automated gate checks** between phases
+4. **Auto-repairs** test failures (up to 3 retries per card)
+5. Tracks progress in a **state file** for resumable execution
+6. **Independent acceptance verification** per card (separate AI verifies ACs)
+7. **AI mutual review** for high-risk decisions (SPEC-DECISION / AI-REVIEW / AI-GATE 三级)
+8. **Decision audit trail** (`decisions.jsonl`) for cross-card traceability
+9. **Pipeline completion summary** — auto-generates structured report: what was implemented, files changed, decisions made, test results
+
+## Checklist
+
+You MUST complete these steps in order:
+
+1. **Read the todolist** — understand groups, tasks, phases, dependencies, test commands
+2. **Gather project context** — identify spec doc, source files, test paths, key constraints
+3. **Design the pipeline** — map todolist groups → phases → cards, define gate checks
+4. **Generate all files** — autodev.sh, system_prompt.md, gate_check.sh, cards/*.md, phase_gate.md, state, decisions.jsonl
+5. **Verify** — dry-run the script, confirm all card files exist, paths resolve correctly
+
+## Step 1: Read the Todolist
+
+Read the todolist.md file completely. Extract:
+
+| Item | What to look for |
+|------|-----------------|
+| **Groups** | Top-level sections (Group 1, Group 2...) — these become Phases |
+| **Tasks** | Individual numbered items within groups — these become Cards (or get merged into Cards) |
+| **Dependencies** | Which tasks depend on others — determines Card ordering |
+| **Execution phases** | If the todolist defines phases (Phase A, B, C...) — use them directly |
+| **Test commands** | How to run tests — becomes the test verification step |
+| **Key constraints** | Backward compatibility, safety rules, P1 fixes — become system_prompt constraints |
+| **Source files** | Which files are being modified — becomes Card "read existing code" sections |
+| **Spec/design docs** | Referenced design documents — becomes the "single source of truth" |
+
+## Step 2: Gather Project Context
+
+Resolve context autonomously (no human confirmation in runtime):
+
+```
+1. What is the spec/design document path?
+   → This is the "single source of truth" referenced by all cards
+
+2. What is the test command?
+   → e.g., "python3 -m pytest tests/test_foo.py -q" or "npm test"
+
+3. What are the core source files being modified?
+   → Listed in system_prompt as "project files"
+
+4. What are the project-specific constraints?
+   → e.g., "backward compatible", "no breaking changes", "量纲一致性"
+
+5. Where should the Autodev directory live?
+   → Convention: Autodev/{project_name}/
+
+6. If anything is unclear, how should ambiguity be resolved?
+   → Infer from repo evidence (todolist, spec, tests, git history, existing patterns),
+     choose the most conservative backward-compatible option, and record assumptions in
+     system_prompt.md ("Assumptions & Defaults"). Do NOT block for user confirmation.
+```
+
+## Step 3: Design the Pipeline
+
+### Mapping Groups to Phases
+
+Each **Group** in the todolist becomes a **Phase**. Each Phase ends with a **GATE**.
+
+```
+Group 1 → Phase A → GATE:A
+Group 2 → Phase B → GATE:B
+...
+Last Group → Phase N → GATE:FINAL
+```
+
+### Mapping Tasks to Cards
+
+**Merge small related tasks** into single Cards. **Keep complex tasks** as their own Card. Target: **2-5 tasks per Card**, **3-7 Cards per Phase**.
+
+Heuristics for merging:
+- Same source file → merge
+- Sequential dependency with no external dependency → merge
+- Total estimated complexity < 1 Claude session → merge
+
+Heuristics for splitting:
+- Different source files → separate
+- Independent testable unit → separate
+- High complexity (e.g., "MC simulation core") → own Card
+
+### Card ID scheme
+
+Use `{Phase}.{Sequence}` format:
+- Alphanumeric phases: A.1, A.2, B.1, C.1
+- Numeric phases: 0.1, 0.2, 1.1, 2.1
+
+### Adding verification Cards
+
+Add a **verification Card** at the end of each Phase (before the GATE) that:
+- Runs all tests for that phase
+- Checks test coverage against the todolist
+- Runs full regression
+
+### Gate checks
+
+Design gate_check.sh with:
+- **Universal checks** (always include):
+  - Unit tests pass
+  - Full regression tests pass
+  - SPEC-DECISION audit (grep for AI decisions)
+- **Project-specific checks** (customize):
+  - Backward compatibility verification
+  - Contract/interface checks
+  - Config consistency
+  - Import validation
+
+## Step 4: Generate All Files
+
+### Directory Structure
+
+```
+Autodev/{project_name}/
+├── autodev.sh              # Main pipeline script
+├── system_prompt.md        # AI session prompt
+├── gate_check.sh           # Automated gate checks
+├── state                   # Progress tracker (empty file)
+├── decisions.jsonl         # Decision audit trail (empty file, runtime populated)
+├── logs/                   # Runtime logs (empty dir)
+└── cards/
+    ├── {A.1}.md            # Task cards
+    ├── {A.2}.md
+    ├── ...
+    └── phase_gate.md       # Phase gate audit template
+```
+
+`summary.md` is a runtime artifact. Do NOT pre-create it during scaffolding.
+
+### File Templates
+
+#### autodev.sh Template
+
+```bash
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════
+#  {PROJECT_DISPLAY_NAME} — Automated Development Pipeline
+#  用法: ./{AUTODEV_PATH}/autodev.sh [OPTIONS]
+# ═══════════════════════════════════════════════════════════
+set -euo pipefail
+
+# ──── 路径配置 ────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+AUTODEV="$SCRIPT_DIR"
+CARDS_DIR="$AUTODEV/cards"
+LOGS_DIR="$AUTODEV/logs"
+STATE_FILE="$AUTODEV/state"
+SYSTEM_PROMPT="$AUTODEV/system_prompt.md"
+GATE_SCRIPT="$AUTODEV/gate_check.sh"
+
+# ──── macOS 兼容 ────
+if command -v gtimeout &>/dev/null; then
+    TIMEOUT_CMD="gtimeout"
+elif command -v timeout &>/dev/null; then
+    TIMEOUT_CMD="timeout"
+else
+    TIMEOUT_CMD=""
+fi
+
+# ──── 配置 ────
+MODEL="${{ENV_PREFIX}_MODEL:-opus}"
+VERIFY_MODEL="${{ENV_PREFIX}_VERIFY_MODEL:-haiku}"   # 验收验证用轻量模型
+CARD_TIMEOUT="${{ENV_PREFIX}_TIMEOUT:-900}"
+GATE_MAX_RETRIES="${{ENV_PREFIX}_GATE_RETRIES:-3}"
+AC_MAX_RETRIES="${{ENV_PREFIX}_AC_RETRIES:-3}"       # 独立验收最多自修复轮次
+DECISIONS_CONTEXT_LINES="${{ENV_PREFIX}_DECISIONS_CONTEXT_LINES:-120}"
+DECISIONS_FILE="$AUTODEV/decisions.jsonl"            # 决策审计追踪
+PHASE_BASELINE_FILE="$AUTODEV/.phase_baseline"       # 每个 Phase 的 diff 基线
+SUMMARY_FILE="$AUTODEV/summary.md"                   # Pipeline 完成总结
+
+# ──── 执行顺序 ────
+ALL_STEPS=(
+    {ALL_STEPS_CONTENT}
+)
+
+# ──── 颜色输出 ────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+log_info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_ok()    { echo -e "${GREEN}[OK  ]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_fail()  { echo -e "${RED}[FAIL]${NC} $1"; }
+log_title() {
+    echo ""
+    echo -e "${BOLD}${CYAN}=================================================${NC}"
+    echo -e "${BOLD}${CYAN}  $1${NC}"
+    echo -e "${BOLD}${CYAN}=================================================${NC}"
+}
+
+# ──── 进度管理 (100% 通用，不改) ────
+is_completed() { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
+mark_completed() { echo "$1" >> "$STATE_FILE"; log_ok "完成: $1"; }
+get_completed_count() {
+    if [ -f "$STATE_FILE" ]; then wc -l < "$STATE_FILE" | tr -d ' '
+    else echo "0"; fi
+}
+
+get_next_card_before_gate() {
+    local gate_phase=$1 last_card=""
+    for step in "${ALL_STEPS[@]}"; do
+        local type="${step%%:*}" id="${step#*:}"
+        if [ "$type" = "CARD" ]; then last_card="$id"
+        elif [ "$type" = "GATE" ] && [ "$id" = "$gate_phase" ]; then break; fi
+    done
+    echo "${last_card:-{FIRST_CARD_ID}}"
+}
+
+# ──── 构建 Prompt ────
+build_prompt() {
+    local card_file="$CARDS_DIR/${1}.md"
+    [ ! -f "$card_file" ] && { log_fail "Card 文件不存在: $card_file"; return 1; }
+    {
+        cat "$SYSTEM_PROMPT"; echo ""; echo "---"; echo ""
+        echo "## 运行时信息"
+        echo "AUTODEV_DIR: $AUTODEV"
+        echo "DECISIONS_FILE: $DECISIONS_FILE"
+        echo ""
+        echo "## 当前进度"
+        if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+            echo "已完成的 Card:"; cat "$STATE_FILE" | sed 's/^/- /'
+        else echo "尚无已完成的 Card（首个任务）"; fi
+        # 注入前序决策上下文
+        if [ -f "$DECISIONS_FILE" ] && [ -s "$DECISIONS_FILE" ]; then
+            echo ""; echo "## 前序决策记录（最近 ${DECISIONS_CONTEXT_LINES} 条）"
+            echo '```jsonl'; tail -n "$DECISIONS_CONTEXT_LINES" "$DECISIONS_FILE"; echo '```'
+        fi
+        echo ""; echo "---"; echo ""; cat "$card_file"
+    }
+}
+
+# ──── 执行单张 Card (通用骨架，TEST_CMD 可定制) ────
+execute_card() {
+    local card_id=$1 timestamp=$(date +%Y%m%d_%H%M%S)
+    local log_file="$LOGS_DIR/card_${card_id//./_}_${timestamp}.log"
+    log_title "Card $card_id"
+    local prompt; prompt="$(build_prompt "$card_id")" || return 1
+    log_info "Model: $MODEL | Timeout: ${CARD_TIMEOUT}s"
+    log_info "Log: $log_file"; echo ""
+
+    cd "$PROJECT_ROOT"
+    local exit_code=0
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD "$CARD_TIMEOUT" bash -c \
+            "echo \"\$1\" | claude -p --dangerously-skip-permissions --model \"\$2\" --verbose 2>&1" \
+            -- "$prompt" "$MODEL" | tee "$log_file" || exit_code=$?
+    else
+        bash -c \
+            "echo \"\$1\" | claude -p --dangerously-skip-permissions --model \"\$2\" --verbose 2>&1" \
+            -- "$prompt" "$MODEL" | tee "$log_file" || exit_code=$?
+    fi
+
+    [ $exit_code -eq 124 ] && { log_fail "Card $card_id 超时 (>${CARD_TIMEOUT}s)"; return 1; }
+    [ $exit_code -ne 0 ] && { log_fail "Card $card_id 执行失败 (exit: $exit_code)"; return 1; }
+
+    # 测试验证 + 自动修复循环
+    echo ""
+    local test_attempt=0 tests_passed=false
+    while [ $test_attempt -lt $GATE_MAX_RETRIES ]; do
+        test_attempt=$((test_attempt + 1))
+        log_info "运行测试 (第 ${test_attempt}/${GATE_MAX_RETRIES} 次)..."
+        cd "$PROJECT_ROOT"
+        local test_output
+        test_output=$({TEST_CMD} 2>&1) && tests_passed=true
+        echo "$test_output" | tee -a "$log_file"
+        [ "$tests_passed" = true ] && { log_ok "测试通过"; break; }
+
+        if [ $test_attempt -lt $GATE_MAX_RETRIES ]; then
+            log_warn "测试失败，AI 自动修复 ($test_attempt/$GATE_MAX_RETRIES)..."
+            local fix_prompt="Card $card_id 执行后测试失败，请修复。
+
+## 测试输出
+\`\`\`
+$test_output
+\`\`\`
+
+## 规则
+- 读取失败的测试文件和对应的实现代码
+- 读取设计文档确认正确行为
+- 修复后运行: {TEST_CMD}
+- 只修复导致测试失败的问题，不要做额外改动
+- 不能破坏现有测试（向后兼容）"
+            cd "$PROJECT_ROOT"
+            echo "$fix_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file" || true
+        fi
+    done
+    [ "$tests_passed" != true ] && { log_fail "Card $card_id 测试修复失败"; return 1; }
+
+    # ──── 独立验收验证 + 自动修复闭环 (Acceptance Verifier) ────
+    local card_content
+    card_content=$(cat "$CARDS_DIR/${card_id}.md")
+    local ac_attempt=0 ac_passed=false
+    while [ $ac_attempt -lt $AC_MAX_RETRIES ]; do
+        ac_attempt=$((ac_attempt + 1))
+        log_info "启动独立验收验证 (第 ${ac_attempt}/${AC_MAX_RETRIES} 次)..."
+        local ac_prompt
+        ac_prompt="$(cat <<VERIFY_EOF
+你是独立验收审计员（不是开发者）。验证 Card $card_id 的验收标准是否全部满足。
+
+## Card 完整内容
+$card_content
+
+## 请你：
+1. 读取 Card 中"读取已有代码"列出的源文件，确认修改已就位
+2. 运行 Card 中指定的测试命令，确认通过
+3. 逐条检查验收标准（AC-1, AC-2, ...），判定 PASS 或 FAIL
+4. 输出格式（严格遵守）：
+   AC-1: PASS — 原因
+   AC-2: FAIL — 原因
+   ...
+   VERDICT: ALL_PASS | HAS_FAILURES
+
+重要：你是独立审计员。直接读文件和跑测试来验证，不要信任之前的 AI 输出。
+VERIFY_EOF
+)"
+        local verify_output verify_exit=0
+        verify_output=$(echo "$ac_prompt" | claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose 2>&1) || verify_exit=$?
+        echo "$verify_output" | tee -a "$log_file"
+
+        if [ $verify_exit -eq 0 ] && echo "$verify_output" | grep -q "VERDICT: ALL_PASS"; then
+            log_ok "验收验证通过"
+            ac_passed=true
+            break
+        fi
+
+        if [ $verify_exit -ne 0 ]; then
+            log_warn "验收验证 AI 异常退出 (exit: $verify_exit)，触发自恢复后重试"
+        else
+            log_warn "验收验证发现未满足的 AC，触发修复"
+        fi
+
+        local ac_fix_prompt
+        ac_fix_prompt="$(cat <<FIX_EOF
+验收审计发现以下 AC 未满足：
+
+$verify_output
+
+请修复未通过的验收标准。只修复未通过的项，不要改动已通过的部分。
+修复后运行测试确认通过，并准备再次接受独立验收。
+FIX_EOF
+)"
+        echo "$ac_fix_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file"
+
+        # 修复后重跑测试；失败则继续下一轮自修复，不允许带病通过
+        cd "$PROJECT_ROOT"
+        if ! {TEST_CMD} 2>&1 | tee -a "$log_file"; then
+            log_warn "Card $card_id 验收修复后测试仍失败，将继续自动修复"
+        fi
+    done
+    [ "$ac_passed" != true ] && { log_fail "Card $card_id 验收验证未通过 (达到 AC 重试上限)"; return 1; }
+
+    return 0
+}
+
+# ──── Phase Gate ────
+run_phase_gate() {
+    local phase=$1 timestamp=$(date +%Y%m%d_%H%M%S)
+    local log_file="$LOGS_DIR/gate_${phase}_${timestamp}.log"
+    log_title "Phase Gate: Phase $phase"
+
+    # 1. gate_check.sh + 自动修复循环
+    if [ -f "$GATE_SCRIPT" ]; then
+        local attempt=0 gate_passed=false
+        while [ $attempt -lt $GATE_MAX_RETRIES ]; do
+            attempt=$((attempt + 1))
+            log_info "门禁检查 (第 ${attempt}/${GATE_MAX_RETRIES} 次)..."
+            cd "$PROJECT_ROOT"
+            local gate_output
+            gate_output=$(bash "$GATE_SCRIPT" 2>&1) && gate_passed=true
+            echo "$gate_output" | tee -a "$log_file"
+            [ "$gate_passed" = true ] && { log_ok "自动门禁通过"; break; }
+            if [ $attempt -lt $GATE_MAX_RETRIES ]; then
+                log_warn "门禁未通过，AI 自动修复..."
+                local fix_prompt="门禁检查报告了以下问题，请修复:
+$gate_output
+读取设计文档和测试确认正确行为。只修复问题，不做额外改动。"
+                echo "$fix_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file" || true
+            fi
+        done
+        [ "$gate_passed" != true ] && { log_fail "门禁经 $GATE_MAX_RETRIES 次修复仍未通过"; return 1; }
+    fi
+
+    # 2. AI 审计 (phase_gate.md)
+    log_info "运行 AI 审计..."
+    local gate_prompt
+    gate_prompt="$(cat "$CARDS_DIR/phase_gate.md")
+
+---
+当前审计: Phase $phase
+已完成的 Card:
+$(grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/^CARD:/- /' || echo "（无）")"
+    echo "$gate_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file" || true
+    log_ok "Phase Gate $phase 完成"
+
+    # 3. 更新 Phase 基线（供下一阶段 phase-scoped diff）
+    git rev-parse HEAD > "$PHASE_BASELINE_FILE" 2>/dev/null || true
+    return 0
+}
+
+# ──── Pipeline 完成总结 ────
+generate_summary() {
+    log_title "生成 Pipeline 完成总结"
+    local completed_cards
+    completed_cards=$(grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/CARD://' | tr '\n' ', ' | sed 's/,$//')
+    local completed_gates
+    completed_gates=$(grep "^GATE:" "$STATE_FILE" 2>/dev/null | sed 's/GATE://' | tr '\n' ', ' | sed 's/,$//')
+
+    # 对比 Pipeline 启动时的 baseline（含已提交 + 未提交的全部变更）
+    local diff_ref="${PIPELINE_BASELINE:-HEAD}"
+    local git_diff_stat git_diff_files
+    cd "$PROJECT_ROOT"
+    git_diff_stat=$(git diff --stat "$diff_ref" 2>/dev/null || echo "(no git changes)")
+    # 已提交的变更 + 未提交的变更
+    git_diff_files=$({ git diff --name-only "$diff_ref" 2>/dev/null; git diff --name-only 2>/dev/null; } | sort -u)
+    local decisions_content=""
+    if [ -f "$DECISIONS_FILE" ] && [ -s "$DECISIONS_FILE" ]; then
+        decisions_content=$(cat "$DECISIONS_FILE")
+    fi
+    local log_files
+    log_files=$(ls -1t "$LOGS_DIR"/*.log 2>/dev/null | head -20)
+
+    local summary_prompt
+    summary_prompt="$(cat <<SUMMARY_EOF
+你是 Pipeline 总结报告员。请根据以下信息生成一份结构化总结报告（Markdown 格式）。
+
+## Pipeline 信息
+- 项目: {PROJECT_DISPLAY_NAME}
+- 完成的 Cards: $completed_cards
+- 完成的 Gates: $completed_gates
+
+## Git 变更统计
+\`\`\`
+$git_diff_stat
+\`\`\`
+
+## 变更的文件列表
+$git_diff_files
+
+## 决策记录
+\`\`\`jsonl
+$decisions_content
+\`\`\`
+
+## 请你：
+1. 读取上述变更的文件，理解每个文件做了什么修改
+2. 生成以下格式的总结报告，直接输出 Markdown 内容（不需要代码块包裹）：
+
+# {PROJECT_DISPLAY_NAME} — Pipeline 完成总结
+
+## 实现概要
+（用 2-3 句话概括本次 pipeline 实现了什么）
+
+## 变更清单
+| 文件 | 变更类型 | 说明 |
+|------|----------|------|
+（每个变更文件一行：新增/修改/删除 + 一句话说明做了什么）
+
+## 关键决策
+（从 decisions.jsonl 提取，如无则写"无"）
+- 【Card X.Y】决策描述 — 选择了方案 A，原因...
+
+## 测试结果
+（从 log 文件名推断哪些 Card 执行了，整体结论）
+
+## 注意事项
+（任何残余风险、TODO、或后续建议，如无则写"无"）
+
+重要：只输出 Markdown 报告本身，不要用代码块包裹。
+SUMMARY_EOF
+)"
+
+    local summary_output
+    summary_output=$(echo "$summary_prompt" | claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose 2>&1) || true
+
+    # 提取 Markdown 内容写入文件
+    echo "$summary_output" > "$SUMMARY_FILE"
+    log_ok "总结报告已生成: $SUMMARY_FILE"
+
+    # 在终端直接展示总结
+    echo ""
+    echo -e "${BOLD}${CYAN}=================================================${NC}"
+    echo -e "${BOLD}${CYAN}  Pipeline 完成总结${NC}"
+    echo -e "${BOLD}${CYAN}=================================================${NC}"
+    echo ""
+    cat "$SUMMARY_FILE"
+    echo ""
+}
+
+# ──── CLI ────
+show_help() {
+    echo "{PROJECT_DISPLAY_NAME} — Automated Development Pipeline"
+    echo ""
+    echo "用法: ./{AUTODEV_PATH}/autodev.sh [OPTIONS]"
+    echo ""
+    echo "选项:"
+    echo "  --from CARD_ID    从指定 Card 开始 (如 --from B.1)"
+    echo "  --model MODEL     Claude 模型 (默认: opus)"
+    echo "  --reset           清除所有进度，从头开始"
+    echo "  --dry-run         只显示执行计划，不实际执行"
+    echo "  --status          显示当前进度"
+    echo "  --help            显示此帮助"
+}
+
+show_status() {
+    local total=${#ALL_STEPS[@]} done=$(get_completed_count)
+    echo ""; echo "{PROJECT_DISPLAY_NAME} 开发进度: $done / $total"; echo ""
+    for step in "${ALL_STEPS[@]}"; do
+        local id="${step#*:}" type="${step%%:*}"
+        if is_completed "$step"; then
+            echo -e "  ${GREEN}[DONE]${NC} [$type] $id"
+        else
+            echo -e "  ⬜ [$type] $id"
+        fi
+    done
+}
+
+main() {
+    local start_from="" dry_run=false
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --from)     start_from="$2"; shift 2 ;;
+            --model)    MODEL="$2"; shift 2 ;;
+            --reset)    rm -f "$STATE_FILE"; log_info "进度已清除"; shift ;;
+            --dry-run)  dry_run=true; shift ;;
+            --status)   show_status; exit 0 ;;
+            --help)     show_help; exit 0 ;;
+            *)          log_fail "未知选项: $1"; show_help; exit 1 ;;
+        esac
+    done
+
+    mkdir -p "$LOGS_DIR"
+    touch "$STATE_FILE"
+
+    # 记录 Pipeline 起点（用于最终 summary diff）
+    PIPELINE_BASELINE=$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+
+    log_title "{PROJECT_DISPLAY_NAME} — Pipeline 启动"
+    log_info "Model: $MODEL | Progress: $(get_completed_count)/${#ALL_STEPS[@]}"
+
+    if [ "$dry_run" = true ]; then
+        for step in "${ALL_STEPS[@]}"; do
+            local type="${step%%:*}" id="${step#*:}"
+            if is_completed "$step"; then
+                echo -e "  ${GREEN}[SKIP]${NC} $type $id"
+            else
+                echo -e "  ${YELLOW}[TODO]${NC} $type $id"
+            fi
+        done
+        exit 0
+    fi
+
+    local skip=false cards_executed=0 start_time=$(date +%s)
+    [ -n "$start_from" ] && skip=true
+
+    for step in "${ALL_STEPS[@]}"; do
+        local type="${step%%:*}" id="${step#*:}"
+        if [ "$skip" = true ]; then
+            [ "$id" = "$start_from" ] && skip=false || continue
+        fi
+        is_completed "$step" && { log_info "跳过已完成: $type $id"; continue; }
+
+        if [ "$type" = "GATE" ]; then
+            run_phase_gate "$id" && mark_completed "$step" || { log_fail "Gate $id 失败"; exit 1; }
+        elif [ "$type" = "CARD" ]; then
+            execute_card "$id" && { mark_completed "$step"; cards_executed=$((cards_executed + 1)); } \
+                || { log_fail "Card $id 失败，重跑: ./{AUTODEV_PATH}/autodev.sh --from $id"; exit 1; }
+        fi
+    done
+
+    local elapsed=$(( ($(date +%s) - start_time) / 60 ))
+    generate_summary
+    log_title "Pipeline 完成！Cards: $cards_executed | 耗时: ${elapsed}m"
+}
+main "$@"
+```
+
+**IMPORTANT**: Do NOT use this template literally. Generate the FULL script with all functions expanded (like the real autodev.sh files). The template above shows the *structure* — the actual output must be a complete, runnable bash script.
+
+#### system_prompt.md Template
+
+Structure (customize content):
+
+```markdown
+# {PROJECT_DISPLAY_NAME} — 自动开发会话
+
+## 你的角色
+你是 {PROJECT_NAME} 的开发者。严格按照设计文档实现，不添加文档未要求的功能。
+
+## 项目文件
+| 文件 | 路径 | 用途 |
+|------|------|------|
+| **设计文档** | `{SPEC_PATH}` | 唯一设计真相源 |
+| **任务清单** | `{TODOLIST_PATH}` | 详细任务分解 |
+{ADDITIONAL_FILES}
+
+## TDD 流程
+Step 1: RED → Step 2: GREEN → Step 3: SPEC → Step 4: LINT → Step 5: RUN
+
+## 核心约束（从 todolist 的 P1/P2 修正中提取）
+{PROJECT_CONSTRAINTS}
+
+## 决策协议（无人值守环境）
+
+本会话无人类在场。所有需要"人类确认"的场景，由 **AI 互相确认**替代。
+
+### Level 1: SPEC-DECISION（自决 — 低风险歧义）
+
+适用：参数命名、代码风格、小范围实现选择等不影响架构的决策。
+
+```
+Round 1: 列举所有可能方案
+Round 2: 推演每个方案的影响 + 与文档其他部分的一致性
+Round 3: 选择最优方案 + 标注残余风险
+```
+
+在代码中标注: `# SPEC-DECISION: chose B over A because ...`
+
+### Level 2: AI-REVIEW（互审 — 高风险决策）
+
+适用：架构变更、P1 约束相关、向后兼容影响、跨文件接口修改、设计文档歧义有多种合理解读。
+
+**触发条件**（满足任一即触发 AI-REVIEW 而非 SPEC-DECISION）：
+- 涉及 P1/P2 约束的实现选择
+- 影响 2+ 个文件的接口变更
+- SPEC-DECISION Round 3 仍有"高"残余风险
+- 修改可能破坏现有测试或向后兼容性
+
+**Review Agent 专业化**：根据触发原因自动选择审计角色：
+
+| 触发原因 | 审计角色 | 审查重点 |
+|---------|---------|---------|
+| 向后兼容影响 | **Compatibility Reviewer** | 现有调用方是否不受影响、默认值是否保持、回归测试覆盖 |
+| 跨文件接口变更 | **Interface Reviewer** | 签名一致性、类型匹配、调用链完整性 |
+| P1/P2 约束相关 | **Constraint Reviewer** | 约束是否被满足、边界条件、降级路径 |
+| 设计文档歧义 | **Spec Reviewer** | 文档各章节一致性、与已实现代码的匹配度 |
+
+**执行方式**：使用 `Task` tool 启动一个独立的 review agent：
+
+```
+Task(subagent_type="general-purpose", prompt="""
+你是 {PROJECT_NAME} 的 {REVIEWER_ROLE}。请审查以下决策：
+
+## 决策上下文
+{描述当前面临的选择}
+
+## 候选方案
+A: {方案A描述}
+B: {方案B描述}
+
+## 相关约束
+{从 todolist/spec 中提取的 P1/P2 约束}
+
+## 请你：
+1. 读取 `{SPEC_PATH}` 相关章节验证两个方案的合规性
+2. 读取 `{TODOLIST_PATH}` 确认任务意图
+3. 读取涉及的源文件评估影响范围
+4. 给出你的独立判断：选择哪个方案 + 理由
+5. 如果两个方案都不合适，提出你的方案
+6. 对每个发现标注严重级别：BLOCK / WARN / SUGGEST
+
+严重级别定义：
+- BLOCK: 必须修改才能继续，违反 P1 约束或破坏现有行为
+- WARN: 建议修改，存在风险但不致命，可标注后跳过
+- SUGGEST: 改进建议，记录但不阻塞流程
+""")
+```
+
+**结果处理**：
+- 两个 AI 一致 → 采用共识方案，标注 `# AI-REVIEW: consensus on B`
+- 两个 AI 分歧 → 按严重级别处理：
+  - 分歧项为 BLOCK → 采用**更保守**的方案，标注 `# AI-REVIEW: disagreement/BLOCK, chose conservative A`
+  - 分歧项为 WARN → 采用 Card AI 的方案，标注 `# AI-REVIEW: disagreement/WARN, proceeded with B`
+  - 分歧项为 SUGGEST → 记录但不改变方案
+
+**决策记录**：每次 AI-REVIEW 完成后，追加到 `decisions.jsonl`（见决策审计追踪）。
+
+### Level 3: AI-GATE（阻断 — 关键节点强制审计）
+
+适用：Phase Gate、Card 完成前的最终验证。已内置于 autodev.sh 的 Phase Gate 流程中。
+
+**与 Phase Gate 的关系**：AI-GATE 是 Phase Gate 的子集，由 gate_check.sh + AI 审计会话自动执行，无需 Card 内部触发。
+
+### 决策审计追踪
+
+每次 SPEC-DECISION 或 AI-REVIEW 完成后，**必须**追加一条记录。
+
+路径来源：`build_prompt()` 会注入 `DECISIONS_FILE: /path/to/decisions.jsonl`，Card AI 从中获取路径。
+
+```python
+import json, datetime
+
+# DECISIONS_FILE 路径从 prompt 的"运行时信息"部分获取
+decisions_path = "Autodev/{project_name}/decisions.jsonl"  # 示例
+
+decision = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "card": "B.1",                            # 当前 Card ID
+    "level": "AI-REVIEW",                     # SPEC-DECISION | AI-REVIEW
+    "reviewer_role": "Compatibility Reviewer", # AI-REVIEW 填写, SPEC-DECISION 为 null
+    "trigger": "backward compat impact",
+    "options": ["A: keyword-only", "B: positional"],
+    "chosen": "A",
+    "severity": "BLOCK",                      # BLOCK | WARN | SUGGEST
+    "consensus": True,                        # AI-REVIEW: 两个 AI 是否一致
+    "rationale": "preserves existing callers",
+    "residual_risk": "none",
+    "file": "src/engine.py",
+    "line": 42
+}
+
+with open(decisions_path, "a") as f:
+    f.write(json.dumps(decision, ensure_ascii=False) + "\n")
+```
+
+**用途**：
+- Gate 审计时统计决策分布（BLOCK/WARN/SUGGEST 数量）
+- 检测应走 AI-REVIEW 但只走了 SPEC-DECISION 的遗漏
+- `build_prompt()` 自动将已有记录注入后续 Card 的 prompt，提供前序决策上下文
+
+## 禁止事项
+- ❌ 添加设计文档未描述的功能
+- ❌ 跳过测试
+- ❌ 修改 Autodev/ 下的文件
+{PROJECT_SPECIFIC_PROHIBITIONS}
+
+## Skill 使用规则
+
+⚠️ **全自动流水线**: 本会话无人类在场，需要人类确认的场景由 AI 互审替代。
+
+### 可用 Skill（已验证自动化安全）
+
+| 时机 | Skill | 说明 |
+|------|-------|------|
+| **开始写代码前** | `/test-driven-development` | 启动 TDD 流程，先写测试再实现 |
+| **测试失败时** | `/systematic-debugging` | 系统化排查，禁止盲猜修复 |
+| **Card 完成前** | `/verification-before-completion` | 运行验证命令确认全部通过 |
+| **Card 含 2+ 独立文件时** | `/dispatching-parallel-agents` | 并行开发独立模块 |
+
+### 原需人类确认的 Skill → AI 互审替代
+
+| 原 Skill | 原阻塞原因 | 替代方案 |
+|----------|-----------|----------|
+| `/brainstorming` | 需用户逐节批准设计 | **AI-REVIEW**: spawn review agent 审核设计决策 |
+| `/subagent-driven-development` | 子代理提问需人类回答 | **AI-REVIEW**: 决策点由 review agent 确认，执行用 `/dispatching-parallel-agents` |
+| `/requesting-code-review` | Critical issue 需人类判断 | **AI-REVIEW**: spawn review agent 做独立 code review，Phase Gate 做最终审计 |
+
+### Skill 调用规则
+
+1. **TDD 必调**: 每张 Card 开始实现时，必须先调用 `/test-driven-development`
+2. **调试必调**: 测试失败 ≥1 次后，必须调用 `/systematic-debugging`
+3. **完成必调**: 声明 Card 完成前，必须调用 `/verification-before-completion`
+4. **并行优先**: 当 Card 包含多个独立文件时，优先用 `/dispatching-parallel-agents`
+5. **决策分级**: 低风险用 SPEC-DECISION 自决，高风险用 AI-REVIEW 互审
+```
+
+#### Card Template
+
+```markdown
+# Card {CARD_ID}: {CARD_TITLE}
+
+## 读取设计文档
+从 `{SPEC_PATH}` 读取：
+- {RELEVANT_SECTIONS}
+
+从 `{TODOLIST_PATH}` 读取：
+- {RELEVANT_TASKS}
+
+## 读取已有代码
+- {EXISTING_FILES_TO_READ}
+
+## 任务
+{TASKS_WITH_CODE_SNIPPETS}
+
+## 验收标准
+- [ ] AC-1: {ACCEPTANCE_CRITERION_1}
+- [ ] AC-2: {ACCEPTANCE_CRITERION_2}
+...
+- [ ] AC-N: 所有测试通过
+- [ ] AC-N+1: 现有测试不受影响（如适用）
+```
+
+#### gate_check.sh Template
+
+```bash
+#!/bin/bash
+set -e
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+AUTODEV_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_ROOT"
+PASS=0; FAIL=0; WARN=0
+check_pass() { echo -e "\033[0;32m  ✅ $1\033[0m"; PASS=$((PASS+1)); }
+check_fail() { echo -e "\033[0;31m  ❌ $1\033[0m"; FAIL=$((FAIL+1)); }
+check_warn() { echo -e "\033[1;33m  ⚠️  $1\033[0m"; WARN=$((WARN+1)); }
+
+echo "═══════════════════════════════════════════════"
+echo "  {PROJECT_DISPLAY_NAME} — Phase Gate Checks"
+echo "═══════════════════════════════════════════════"
+
+# ──── 通用检查 ────
+
+# 1. 核心单元测试
+# 2. 全量回归测试
+
+# 3. SPEC-DECISION / AI-REVIEW 审计
+echo ""
+echo "── 决策审计 ──"
+spec_count=$(grep -r "SPEC-DECISION" {SOURCE_DIRS} 2>/dev/null | wc -l | tr -d ' ')
+review_count=$(grep -r "AI-REVIEW" {SOURCE_DIRS} 2>/dev/null | wc -l | tr -d ' ')
+echo "  SPEC-DECISION 标注: $spec_count 处"
+echo "  AI-REVIEW 标注: $review_count 处"
+
+# 4. AI-REVIEW 覆盖率检查
+# 检查跨文件变更是否有对应的 AI-REVIEW 记录
+if [ -f "$AUTODEV_DIR/decisions.jsonl" ] && [ -s "$AUTODEV_DIR/decisions.jsonl" ]; then
+    block_count=$(grep -c '"severity": *"BLOCK"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null || echo 0)
+    warn_count=$(grep -c '"severity": *"WARN"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null || echo 0)
+    total_decisions=$(wc -l < "$AUTODEV_DIR/decisions.jsonl" | tr -d ' ')
+    review_decisions=$(grep -c '"level": *"AI-REVIEW"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null || echo 0)
+    echo "  decisions.jsonl: $total_decisions 条记录 (AI-REVIEW: $review_decisions, BLOCK: $block_count, WARN: $warn_count)"
+    # 检查是否有未解决的 BLOCK
+    unresolved_blocks=$(grep '"severity": *"BLOCK"' "$AUTODEV_DIR/decisions.jsonl" | grep '"consensus": *false' | wc -l | tr -d ' ')
+    if [ "$unresolved_blocks" -gt 0 ]; then
+        check_fail "存在 $unresolved_blocks 个未达成共识的 BLOCK 级决策"
+    else
+        check_pass "所有 BLOCK 级决策已达成共识"
+    fi
+else
+    check_warn "decisions.jsonl 为空或不存在，无法审计决策覆盖率"
+fi
+
+# 5. 跨文件变更 vs AI-REVIEW 匹配检查（Phase 级）
+phase_base_file="$AUTODEV_DIR/.phase_baseline"
+phase_base_ref=""
+[ -f "$phase_base_file" ] && phase_base_ref=$(cat "$phase_base_file")
+if [ -n "$phase_base_ref" ] && git rev-parse --verify "${phase_base_ref}^{commit}" >/dev/null 2>&1; then
+    changed_files=$(git diff --name-only "$phase_base_ref" -- 2>/dev/null | wc -l | tr -d ' ')
+    echo "  Phase 基线: $phase_base_ref"
+    phase_review_count=0
+    while IFS= read -r changed_file; do
+        [ -f "$changed_file" ] || continue
+        file_review_count=$(grep -c "AI-REVIEW" "$changed_file" 2>/dev/null || true)
+        phase_review_count=$((phase_review_count + file_review_count))
+    done < <(git diff --name-only "$phase_base_ref" -- 2>/dev/null)
+else
+    changed_files=$(git diff --name-only HEAD 2>/dev/null | wc -l | tr -d ' ')
+    phase_review_count=$review_count
+    check_warn "未找到有效 .phase_baseline，暂回退到工作区 diff；建议每个 Gate 成功后更新该基线"
+fi
+if [ "$changed_files" -gt 3 ] && [ "$phase_review_count" -eq 0 ]; then
+    check_warn "本 Phase 变更了 $changed_files 个文件但代码中无 AI-REVIEW 标注"
+else
+    check_pass "AI-REVIEW 覆盖率正常 ($changed_files 文件变更, 本 Phase $phase_review_count 处 AI-REVIEW 标注)"
+fi
+
+# ──── 项目特定检查 (定制) ────
+# 6-N. {PROJECT_SPECIFIC_CHECKS}
+
+# ──── 汇总 ────
+echo ""
+echo "═══════════════════════════════════════════════"
+echo "结果: ✅ $PASS | ❌ $FAIL | ⚠️  $WARN"
+[ $FAIL -gt 0 ] && exit 1 || exit 0
+```
+
+#### phase_gate.md Template
+
+```markdown
+# Phase Gate 审计
+
+## 你的角色
+你是 {PROJECT_NAME} 的合规审计员。
+
+## 审计步骤
+1. 读取设计文档
+2. 读取代码变更（git diff）
+3. 逐项检查（项目特定检查清单）
+4. 运行测试
+5. **决策审计**：读取 `{AUTODEV_DIR}/decisions.jsonl`，检查：
+   - 所有 BLOCK 级决策是否已达成共识
+   - 跨文件变更是否有对应 AI-REVIEW 记录
+   - SPEC-DECISION 的残余风险是否合理
+   - 统计本 Phase 决策分布（SPEC-DECISION vs AI-REVIEW, BLOCK/WARN/SUGGEST）
+6. 输出审计报告（通过项 / P0-P2 问题 / 决策审计摘要 / 结论）
+```
+
+## Step 5: Verify
+
+After generating all files:
+
+1. `chmod +x autodev.sh gate_check.sh`
+2. Run `./autodev.sh --dry-run` — verify all steps listed correctly
+3. Run `./autodev.sh --status` — verify display works
+4. Run `./autodev.sh --help` — verify help text
+5. Verify all card files exist: `ls cards/`
+6. Verify state file is empty: `cat state`
+7. Verify decisions.jsonl exists and is empty: `test -f decisions.jsonl && [ ! -s decisions.jsonl ]`
+8. Verify summary.md does NOT exist yet (it's auto-generated at runtime)
+9. Verify generated files contain no unresolved placeholders/stubs:
+   - `! rg -n '\{(PROJECT|SPEC|TODOLIST|TEST_CMD|ALL_STEPS_CONTENT|FIRST_CARD_ID|SOURCE_DIRS|AUTODEV_PATH|ENV_PREFIX|ADDITIONAL_FILES|RELEVANT|EXISTING_FILES|ACCEPTANCE_CRITERION|CARD_TITLE|REVIEWER_ROLE|TASKS_WITH)[^}]*\}' autodev.sh gate_check.sh system_prompt.md cards/*.md`
+   - `! rg -n 'show_help\(\) \{ \.\.\. \}|show_status\(\) \{ \.\.\. \}' autodev.sh`
+
+## Key Principles
+
+1. **Todolist is the source of truth** — every Card traces back to todolist tasks
+2. **P1/P2 fixes become constraints** — embed audit corrections into Card acceptance criteria
+3. **Test command is sacred** — must match what the todolist specifies
+4. **Backward compatibility** — if todolist mentions fallback/compatibility, enforce in gate checks
+5. **No gold-plating** — Cards only implement what the todolist describes
+6. **Each Card is self-contained** — reads its own context, doesn't assume prior Card output was read
+
+## Generator Self-Check
+
+After generating all files, verify these cross-cutting concerns:
+
+1. **system_prompt.md** contains the full 3-level decision protocol (copy from template verbatim)
+2. **Reviewer role table** is customized for the project (add/remove roles as needed; severity levels BLOCK/WARN/SUGGEST are universal — never modify)
+3. **gate_check.sh** includes decisions.jsonl audit checks
+4. **phase_gate.md** includes decision audit as step 5
+5. **All fix prompts** include: test output verbatim, spec/todolist references, "no extra changes", backward compatibility reminder
+6. **`decisions.jsonl` path** flows correctly: config var → `build_prompt()` injects `DECISIONS_FILE:` → Card AI reads it from prompt
