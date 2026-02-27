@@ -1,5 +1,5 @@
 ---
-name: autodev-generator
+name: auto-dev
 description: Use when user says "帮我生成 autodev", "create autodev for", "generate autodev pipeline", or needs to turn a todolist.md into an automated gated TDD development pipeline.
 ---
 

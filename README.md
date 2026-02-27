@@ -1,6 +1,6 @@
-# autodev-generator
+# auto-dev
 
-A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill that generates complete **Autodev automated development pipelines** from a structured todolist.md file.
+A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill plugin that generates complete **Autodev automated development pipelines** from a structured todolist.md file.
 
 ## What it does
 
@@ -34,12 +34,26 @@ The pipeline drives Claude Code through card-by-card development — fully autom
 - **Decision audit trail**: `decisions.jsonl` tracks all decisions across cards
 - **Resumable**: State file tracks progress; restart from any card with `--from`
 - **Pipeline summary**: Auto-generates structured report on completion
+- **Batteries included**: All dependency skills bundled — install once, everything works
 
 ## Install
 
 ```bash
-npx skills add anthropic-rex/autodev-generator
+npx skills add anthropic-rex/AutoDevSkill
 ```
+
+This installs **auto-dev** and all bundled skills:
+
+| Skill | Purpose |
+|-------|---------|
+| `auto-dev` | Core pipeline generator |
+| `test-driven-development` | TDD workflow (from [obra/superpowers](https://github.com/obra/superpowers)) |
+| `systematic-debugging` | Root cause investigation (from obra/superpowers) |
+| `verification-before-completion` | Evidence-based completion (from obra/superpowers) |
+| `dispatching-parallel-agents` | Parallel task execution (from obra/superpowers) |
+| `brainstorming` | Design exploration (from obra/superpowers) |
+| `subagent-driven-development` | Subagent task dispatch (from obra/superpowers) |
+| `requesting-code-review` | Code review workflow (from obra/superpowers) |
 
 ## Usage
 
@@ -105,6 +119,10 @@ Each **Gate** runs automated checks:
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed
 - A `todolist.md` with grouped tasks (the skill reads this to generate the pipeline)
 - Optionally, a spec/design document referenced by the todolist
+
+## Credits
+
+Bundled skills are from [obra/superpowers](https://github.com/obra/superpowers) by Jesse Vincent, licensed under MIT.
 
 ## License
 
