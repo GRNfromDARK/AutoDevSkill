@@ -125,6 +125,13 @@ AutoDevSkill/
 
 ## Changelog
 
+### v1.1 (2026-03-05)
+
+- **BREAKING**: Default model for all AI calls changed to `opus` (including verification). Override with `{ENV_PREFIX}_VERIFY_MODEL` env var if needed.
+- **Fix**: Heredoc variable expansion — dynamic content (`$test_output`, `$verify_output`, `$card_content`, etc.) containing shell metacharacters (`$`, `` ` ``, `\`, ANSI escapes) was silently destroyed by unquoted heredoc expansion. Now uses temp files with `printf '%s\n'` for safe injection.
+- **Fix**: `echo "$prompt" | claude` replaced with `claude < tmpfile` to avoid `ARG_MAX` failures on large prompts (test output, card content, AI verbose output).
+- **Fix**: Gate fix, AC fix, and summary prompts all migrated to the same safe temp-file pattern.
+
 ### v1.01 (2026-02-27)
 
 - Minor improvements and fixes

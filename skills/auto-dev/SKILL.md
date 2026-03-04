@@ -183,7 +183,7 @@ fi
 
 # ──── 配置 ────
 MODEL="${{ENV_PREFIX}_MODEL:-opus}"
-VERIFY_MODEL="${{ENV_PREFIX}_VERIFY_MODEL:-haiku}"   # 验收验证用轻量模型
+VERIFY_MODEL="${{ENV_PREFIX}_VERIFY_MODEL:-opus}"   # 验收验证模型
 CARD_TIMEOUT="${{ENV_PREFIX}_TIMEOUT:-900}"
 GATE_MAX_RETRIES="${{ENV_PREFIX}_GATE_RETRIES:-3}"
 AC_MAX_RETRIES="${{ENV_PREFIX}_AC_RETRIES:-3}"       # 独立验收最多自修复轮次
@@ -211,6 +211,11 @@ log_title() {
     echo -e "${BOLD}${CYAN}  $1${NC}"
     echo -e "${BOLD}${CYAN}=================================================${NC}"
 }
+
+# ──── 安全 Prompt 传递 ────
+# 所有动态内容（测试输出、AI 输出等）通过临时文件 + printf '%s\n' 传递给 claude，
+# 避免: (1) 未引号 heredoc 导致 $、`、\ 被 shell 展开  (2) echo 超长字符串触发 ARG_MAX
+# 模式: mktemp → { echo静态; printf '%s\n' "$动态变量"; cat <<'EOF' 静态 EOF } > tmpfile → claude < tmpfile
 
 # ──── 进度管理 (100% 通用，不改) ────
 is_completed() { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
@@ -263,16 +268,17 @@ execute_card() {
     log_info "Log: $log_file"; echo ""
 
     cd "$PROJECT_ROOT"
+    local prompt_file; prompt_file=$(mktemp "${TMPDIR:-/tmp}/autodev_prompt.XXXXXX")
+    printf '%s' "$prompt" > "$prompt_file"
     local exit_code=0
     if [ -n "$TIMEOUT_CMD" ]; then
-        $TIMEOUT_CMD "$CARD_TIMEOUT" bash -c \
-            "echo \"\$1\" | claude -p --dangerously-skip-permissions --model \"\$2\" --verbose 2>&1" \
-            -- "$prompt" "$MODEL" | tee "$log_file" || exit_code=$?
+        $TIMEOUT_CMD "$CARD_TIMEOUT" claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+            < "$prompt_file" 2>&1 | tee "$log_file" || exit_code=$?
     else
-        bash -c \
-            "echo \"\$1\" | claude -p --dangerously-skip-permissions --model \"\$2\" --verbose 2>&1" \
-            -- "$prompt" "$MODEL" | tee "$log_file" || exit_code=$?
+        claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+            < "$prompt_file" 2>&1 | tee "$log_file" || exit_code=$?
     fi
+    rm -f "$prompt_file"
 
     [ $exit_code -eq 124 ] && { log_fail "Card $card_id 超时 (>${CARD_TIMEOUT}s)"; return 1; }
     [ $exit_code -ne 0 ] && { log_fail "Card $card_id 执行失败 (exit: $exit_code)"; return 1; }
@@ -291,21 +297,28 @@ execute_card() {
 
         if [ $test_attempt -lt $GATE_MAX_RETRIES ]; then
             log_warn "测试失败，AI 自动修复 ($test_attempt/$GATE_MAX_RETRIES)..."
-            local fix_prompt="Card $card_id 执行后测试失败，请修复。
-
-## 测试输出
-\`\`\`
-$test_output
-\`\`\`
-
+            local fix_file; fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_fix.XXXXXX")
+            {
+                echo "Card $card_id 执行后测试失败，请修复。"
+                echo ""
+                echo "## 测试输出"
+                echo '```'
+                printf '%s\n' "$test_output"
+                echo '```'
+                echo ""
+                cat <<'FIX_RULES_EOF'
 ## 规则
 - 读取失败的测试文件和对应的实现代码
 - 读取设计文档确认正确行为
 - 修复后运行: {TEST_CMD}
 - 只修复导致测试失败的问题，不要做额外改动
-- 不能破坏现有测试（向后兼容）"
+- 不能破坏现有测试（向后兼容）
+FIX_RULES_EOF
+            } > "$fix_file"
             cd "$PROJECT_ROOT"
-            echo "$fix_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file" || true
+            claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+                < "$fix_file" 2>&1 | tee -a "$log_file" || true
+            rm -f "$fix_file"
         fi
     done
     [ "$tests_passed" != true ] && { log_fail "Card $card_id 测试修复失败"; return 1; }
@@ -317,13 +330,14 @@ $test_output
     while [ $ac_attempt -lt $AC_MAX_RETRIES ]; do
         ac_attempt=$((ac_attempt + 1))
         log_info "启动独立验收验证 (第 ${ac_attempt}/${AC_MAX_RETRIES} 次)..."
-        local ac_prompt
-        ac_prompt="$(cat <<VERIFY_EOF
-你是独立验收审计员（不是开发者）。验证 Card $card_id 的验收标准是否全部满足。
-
-## Card 完整内容
-$card_content
-
+        local ac_file; ac_file=$(mktemp "${TMPDIR:-/tmp}/autodev_ac.XXXXXX")
+        {
+            echo "你是独立验收审计员（不是开发者）。验证 Card $card_id 的验收标准是否全部满足。"
+            echo ""
+            echo "## Card 完整内容"
+            printf '%s\n' "$card_content"
+            echo ""
+            cat <<'VERIFY_STATIC_EOF'
 ## 请你：
 1. 读取 Card 中"读取已有代码"列出的源文件，确认修改已就位
 2. 运行 Card 中指定的测试命令，确认通过
@@ -335,10 +349,11 @@ $card_content
    VERDICT: ALL_PASS | HAS_FAILURES
 
 重要：你是独立审计员。直接读文件和跑测试来验证，不要信任之前的 AI 输出。
-VERIFY_EOF
-)"
+VERIFY_STATIC_EOF
+        } > "$ac_file"
         local verify_output verify_exit=0
-        verify_output=$(echo "$ac_prompt" | claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose 2>&1) || verify_exit=$?
+        verify_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$ac_file" 2>&1) || verify_exit=$?
+        rm -f "$ac_file"
         echo "$verify_output" | tee -a "$log_file"
 
         if [ $verify_exit -eq 0 ] && echo "$verify_output" | grep -q "VERDICT: ALL_PASS"; then
@@ -353,17 +368,20 @@ VERIFY_EOF
             log_warn "验收验证发现未满足的 AC，触发修复"
         fi
 
-        local ac_fix_prompt
-        ac_fix_prompt="$(cat <<FIX_EOF
-验收审计发现以下 AC 未满足：
-
-$verify_output
-
+        local ac_fix_file; ac_fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_acfix.XXXXXX")
+        {
+            echo "验收审计发现以下 AC 未满足："
+            echo ""
+            printf '%s\n' "$verify_output"
+            echo ""
+            cat <<'AC_FIX_STATIC_EOF'
 请修复未通过的验收标准。只修复未通过的项，不要改动已通过的部分。
 修复后运行测试确认通过，并准备再次接受独立验收。
-FIX_EOF
-)"
-        echo "$ac_fix_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file"
+AC_FIX_STATIC_EOF
+        } > "$ac_fix_file"
+        claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+            < "$ac_fix_file" 2>&1 | tee -a "$log_file"
+        rm -f "$ac_fix_file"
 
         # 修复后重跑测试；失败则继续下一轮自修复，不允许带病通过
         cd "$PROJECT_ROOT"
@@ -395,10 +413,15 @@ run_phase_gate() {
             [ "$gate_passed" = true ] && { log_ok "自动门禁通过"; break; }
             if [ $attempt -lt $GATE_MAX_RETRIES ]; then
                 log_warn "门禁未通过，AI 自动修复..."
-                local fix_prompt="门禁检查报告了以下问题，请修复:
-$gate_output
-读取设计文档和测试确认正确行为。只修复问题，不做额外改动。"
-                echo "$fix_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file" || true
+                local gate_fix_file; gate_fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_gatefix.XXXXXX")
+                {
+                    echo "门禁检查报告了以下问题，请修复:"
+                    printf '%s\n' "$gate_output"
+                    echo "读取设计文档和测试确认正确行为。只修复问题，不做额外改动。"
+                } > "$gate_fix_file"
+                claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+                    < "$gate_fix_file" 2>&1 | tee -a "$log_file" || true
+                rm -f "$gate_fix_file"
             fi
         done
         [ "$gate_passed" != true ] && { log_fail "门禁经 $GATE_MAX_RETRIES 次修复仍未通过"; return 1; }
@@ -406,14 +429,18 @@ $gate_output
 
     # 2. AI 审计 (phase_gate.md)
     log_info "运行 AI 审计..."
-    local gate_prompt
-    gate_prompt="$(cat "$CARDS_DIR/phase_gate.md")
-
----
-当前审计: Phase $phase
-已完成的 Card:
-$(grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/^CARD:/- /' || echo "（无）")"
-    echo "$gate_prompt" | claude -p --dangerously-skip-permissions --model "$MODEL" --verbose 2>&1 | tee -a "$log_file" || true
+    local gate_audit_file; gate_audit_file=$(mktemp "${TMPDIR:-/tmp}/autodev_audit.XXXXXX")
+    {
+        cat "$CARDS_DIR/phase_gate.md"
+        echo ""
+        echo "---"
+        echo "当前审计: Phase $phase"
+        echo "已完成的 Card:"
+        grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/^CARD:/- /' || echo "（无）"
+    } > "$gate_audit_file"
+    claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+        < "$gate_audit_file" 2>&1 | tee -a "$log_file" || true
+    rm -f "$gate_audit_file"
     log_ok "Phase Gate $phase 完成"
 
     # 3. 更新 Phase 基线（供下一阶段 phase-scoped diff）
@@ -443,28 +470,31 @@ generate_summary() {
     local log_files
     log_files=$(ls -1t "$LOGS_DIR"/*.log 2>/dev/null | head -20)
 
-    local summary_prompt
-    summary_prompt="$(cat <<SUMMARY_EOF
+    local summary_file_prompt; summary_file_prompt=$(mktemp "${TMPDIR:-/tmp}/autodev_summary.XXXXXX")
+    {
+        cat <<'SUMMARY_STATIC_1'
 你是 Pipeline 总结报告员。请根据以下信息生成一份结构化总结报告（Markdown 格式）。
 
 ## Pipeline 信息
-- 项目: {PROJECT_DISPLAY_NAME}
-- 完成的 Cards: $completed_cards
-- 完成的 Gates: $completed_gates
-
-## Git 变更统计
-\`\`\`
-$git_diff_stat
-\`\`\`
-
-## 变更的文件列表
-$git_diff_files
-
-## 决策记录
-\`\`\`jsonl
-$decisions_content
-\`\`\`
-
+SUMMARY_STATIC_1
+        echo "- 项目: {PROJECT_DISPLAY_NAME}"
+        echo "- 完成的 Cards: $completed_cards"
+        echo "- 完成的 Gates: $completed_gates"
+        echo ""
+        echo "## Git 变更统计"
+        echo '```'
+        printf '%s\n' "$git_diff_stat"
+        echo '```'
+        echo ""
+        echo "## 变更的文件列表"
+        printf '%s\n' "$git_diff_files"
+        echo ""
+        echo "## 决策记录"
+        echo '```jsonl'
+        printf '%s\n' "$decisions_content"
+        echo '```'
+        echo ""
+        cat <<'SUMMARY_STATIC_2'
 ## 请你：
 1. 读取上述变更的文件，理解每个文件做了什么修改
 2. 生成以下格式的总结报告，直接输出 Markdown 内容（不需要代码块包裹）：
@@ -490,11 +520,12 @@ $decisions_content
 （任何残余风险、TODO、或后续建议，如无则写"无"）
 
 重要：只输出 Markdown 报告本身，不要用代码块包裹。
-SUMMARY_EOF
-)"
+SUMMARY_STATIC_2
+    } > "$summary_file_prompt"
 
     local summary_output
-    summary_output=$(echo "$summary_prompt" | claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose 2>&1) || true
+    summary_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$summary_file_prompt" 2>&1) || true
+    rm -f "$summary_file_prompt"
 
     # 提取 Markdown 内容写入文件
     echo "$summary_output" > "$SUMMARY_FILE"
