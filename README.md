@@ -51,7 +51,7 @@ This skill handles **code implementation** — generating automated TDD pipeline
 
 - **Spec-anchored TDD** — 5-step closure per card: RED → GREEN → SPEC → LINT → RUN
 - **Automated gate checks** — Unit tests, regression, decision audit, cross-file coverage at phase boundaries
-- **Auto-repair** — Up to 3 retries per card on test failure
+- **Auto-repair** — Up to 10 retries per card on test failure
 - **Independent acceptance verification** — Separate AI verifies each acceptance criterion
 - **3-level decision protocol** — SPEC-DECISION (self), AI-REVIEW (peer), AI-GATE (phase boundary)
 - **Decision audit trail** — All decisions logged to `decisions.jsonl` for cross-card traceability
@@ -124,6 +124,14 @@ AutoDevSkill/
 ```
 
 ## Changelog
+
+### v1.2 (2026-03-06)
+
+- **Fix**: Test retry limit increased from 3 to 10 — template was incorrectly reusing `GATE_MAX_RETRIES` (default 3) for the test loop instead of a dedicated `TEST_MAX_RETRIES` variable. Now configurable via `{ENV_PREFIX}_TEST_RETRIES` env var (default: 10).
+- **Fix**: Interactive test blocking — pipelines could hang indefinitely when the test command included interactive tests (e.g., wallet tests requiring private key input via `input()`). Added three layers of protection:
+  1. **Generation-time**: Step 2 now requires scanning test directories for interactive tests (`input()`, `getpass()`, wallet prompts, manual e2e) and adding `--ignore` flags to exclude them.
+  2. **Runtime**: Test execution wrapped with 300s timeout via `$TIMEOUT_CMD`; exit code 124 triggers immediate failure with descriptive error message instead of hanging forever.
+  3. **Principles**: Added "Test command must be non-interactive" as Key Principle #4.
 
 ### v1.1 (2026-03-05)
 

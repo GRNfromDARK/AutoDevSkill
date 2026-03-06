@@ -18,7 +18,7 @@ Autodev is a **spec-anchored, gate-guarded, TDD-enforced automated development m
 1. Splits a task list into sequential **Task Cards** (one AI session per card)
 2. Enforces **TDD 5-step closure** per card (RED → GREEN → SPEC → LINT → GATE)
 3. Runs **automated gate checks** between phases
-4. **Auto-repairs** test failures (up to 3 retries per card)
+4. **Auto-repairs** test failures (up to 10 retries per card)
 5. Tracks progress in a **state file** for resumable execution
 6. **Independent acceptance verification** per card (separate AI verifies ACs)
 7. **AI mutual review** for high-risk decisions (SPEC-DECISION / AI-REVIEW / AI-GATE 三级)
@@ -61,16 +61,29 @@ Resolve context autonomously (no human confirmation in runtime):
 2. What is the test command?
    → e.g., "python3 -m pytest tests/test_foo.py -q" or "npm test"
 
-3. What are the core source files being modified?
+3. Are there any interactive/manual tests that must be excluded?
+   → CRITICAL: Scan the test directories for tests that require interactive input
+     (stdin prompts, private keys, manual confirmation, GUI interaction, network
+     services that won't be available in CI). These MUST be excluded from the test
+     command via --ignore or path filtering.
+   → Common patterns to look for:
+     - input(), getpass(), prompt(), readline() calls in test files
+     - Tests under directories named: live/, manual/, interactive/, e2e/, integration/
+     - Tests that connect to external wallets, require API keys at runtime, or need
+       running services
+   → Add --ignore flags for each such directory/file. The generated test command must
+     be fully non-interactive and able to run unattended.
+
+4. What are the core source files being modified?
    → Listed in system_prompt as "project files"
 
-4. What are the project-specific constraints?
+5. What are the project-specific constraints?
    → e.g., "backward compatible", "no breaking changes", "量纲一致性"
 
-5. Where should the Autodev directory live?
+6. Where should the Autodev directory live?
    → Convention: Autodev/{project_name}/
 
-6. If anything is unclear, how should ambiguity be resolved?
+7. If anything is unclear, how should ambiguity be resolved?
    → Infer from repo evidence (todolist, spec, tests, git history, existing patterns),
      choose the most conservative backward-compatible option, and record assumptions in
      system_prompt.md ("Assumptions & Defaults"). Do NOT block for user confirmation.
@@ -186,6 +199,7 @@ MODEL="${{ENV_PREFIX}_MODEL:-opus}"
 VERIFY_MODEL="${{ENV_PREFIX}_VERIFY_MODEL:-opus}"   # 验收验证模型
 CARD_TIMEOUT="${{ENV_PREFIX}_TIMEOUT:-900}"
 GATE_MAX_RETRIES="${{ENV_PREFIX}_GATE_RETRIES:-3}"
+TEST_MAX_RETRIES="${{ENV_PREFIX}_TEST_RETRIES:-10}"   # 测试自动修复最多重试次数
 AC_MAX_RETRIES="${{ENV_PREFIX}_AC_RETRIES:-3}"       # 独立验收最多自修复轮次
 DECISIONS_CONTEXT_LINES="${{ENV_PREFIX}_DECISIONS_CONTEXT_LINES:-120}"
 DECISIONS_FILE="$AUTODEV/decisions.jsonl"            # 决策审计追踪
@@ -235,6 +249,42 @@ get_next_card_before_gate() {
     echo "${last_card:-{FIRST_CARD_ID}}"
 }
 
+# ──── Pipeline 文件防篡改保护 ────
+# 防止 Claude agent 越界修改 state 文件或读取其他 Card 文件。
+# 机制: chmod 444 (只读) + backup + 完整性校验 + 自动恢复。
+_state_backup=""
+protect_pipeline_files() {
+    # 1. 备份 state 文件（不存在时跳过）
+    [ ! -f "$STATE_FILE" ] && return 0
+    _state_backup="${STATE_FILE}.bak.$$"
+    cp "$STATE_FILE" "$_state_backup"
+    # 2. state 文件设为只读（阻止 Claude Write 工具写入）
+    chmod 444 "$STATE_FILE" 2>/dev/null || true
+    # 3. 其他 Card 文件设为只读（阻止读取——Claude Read 工具不受影响，
+    #    但防止 agent 修改其他 Card 内容）
+    for f in "$CARDS_DIR"/*.md "$AUTODEV/autodev.sh" "$AUTODEV/system_prompt.md" "$AUTODEV/gate_check.sh"; do
+        [ -f "$f" ] && chmod 444 "$f" 2>/dev/null || true
+    done
+}
+unprotect_pipeline_files() {
+    # 恢复 state 文件写权限
+    chmod 644 "$STATE_FILE" 2>/dev/null || true
+    # 完整性校验: state 文件是否被篡改
+    if [ -n "$_state_backup" ] && [ -f "$_state_backup" ]; then
+        if ! diff -q "$STATE_FILE" "$_state_backup" > /dev/null 2>&1; then
+            log_fail "🚨 STATE FILE TAMPERED by Claude agent! Restoring from backup..."
+            cp "$_state_backup" "$STATE_FILE"
+            chmod 644 "$STATE_FILE"
+        fi
+        rm -f "$_state_backup"
+    fi
+    _state_backup=""
+    # 恢复其他文件权限
+    for f in "$CARDS_DIR"/*.md "$AUTODEV/autodev.sh" "$AUTODEV/system_prompt.md" "$AUTODEV/gate_check.sh"; do
+        [ -f "$f" ] && chmod 644 "$f" 2>/dev/null || true
+    done
+}
+
 # ──── 构建 Prompt ────
 build_prompt() {
     local card_file="$CARDS_DIR/${1}.md"
@@ -242,7 +292,6 @@ build_prompt() {
     {
         cat "$SYSTEM_PROMPT"; echo ""; echo "---"; echo ""
         echo "## 运行时信息"
-        echo "AUTODEV_DIR: $AUTODEV"
         echo "DECISIONS_FILE: $DECISIONS_FILE"
         echo ""
         echo "## 当前进度"
@@ -271,6 +320,7 @@ execute_card() {
     local prompt_file; prompt_file=$(mktemp "${TMPDIR:-/tmp}/autodev_prompt.XXXXXX")
     printf '%s' "$prompt" > "$prompt_file"
     local exit_code=0
+    protect_pipeline_files
     if [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "$CARD_TIMEOUT" claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
             < "$prompt_file" 2>&1 | tee "$log_file" || exit_code=$?
@@ -278,6 +328,7 @@ execute_card() {
         claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
             < "$prompt_file" 2>&1 | tee "$log_file" || exit_code=$?
     fi
+    unprotect_pipeline_files
     rm -f "$prompt_file"
 
     [ $exit_code -eq 124 ] && { log_fail "Card $card_id 超时 (>${CARD_TIMEOUT}s)"; return 1; }
@@ -286,17 +337,27 @@ execute_card() {
     # 测试验证 + 自动修复循环
     echo ""
     local test_attempt=0 tests_passed=false
-    while [ $test_attempt -lt $GATE_MAX_RETRIES ]; do
+    local test_timeout=300  # 测试命令最多运行 5 分钟，防止交互式测试阻塞
+    while [ $test_attempt -lt $TEST_MAX_RETRIES ]; do
         test_attempt=$((test_attempt + 1))
-        log_info "运行测试 (第 ${test_attempt}/${GATE_MAX_RETRIES} 次)..."
+        log_info "运行测试 (第 ${test_attempt}/${TEST_MAX_RETRIES} 次)..."
         cd "$PROJECT_ROOT"
-        local test_output
-        test_output=$({TEST_CMD} 2>&1) && tests_passed=true
+        local test_output test_exit=0
+        if [ -n "$TIMEOUT_CMD" ]; then
+            test_output=$($TIMEOUT_CMD "$test_timeout" {TEST_CMD} 2>&1) || test_exit=$?
+        else
+            test_output=$({TEST_CMD} 2>&1) || test_exit=$?
+        fi
+        if [ $test_exit -eq 124 ]; then
+            log_fail "测试命令超时 (>${test_timeout}s)，可能存在交互式测试阻塞。请检查测试命令是否排除了需要交互输入的测试。"
+            return 1
+        fi
+        [ $test_exit -eq 0 ] && tests_passed=true
         echo "$test_output" | tee -a "$log_file"
         [ "$tests_passed" = true ] && { log_ok "测试通过"; break; }
 
-        if [ $test_attempt -lt $GATE_MAX_RETRIES ]; then
-            log_warn "测试失败，AI 自动修复 ($test_attempt/$GATE_MAX_RETRIES)..."
+        if [ $test_attempt -lt $TEST_MAX_RETRIES ]; then
+            log_warn "测试失败，AI 自动修复 ($test_attempt/$TEST_MAX_RETRIES)..."
             local fix_file; fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_fix.XXXXXX")
             {
                 echo "Card $card_id 执行后测试失败，请修复。"
@@ -316,8 +377,10 @@ execute_card() {
 FIX_RULES_EOF
             } > "$fix_file"
             cd "$PROJECT_ROOT"
+            protect_pipeline_files
             claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
                 < "$fix_file" 2>&1 | tee -a "$log_file" || true
+            unprotect_pipeline_files
             rm -f "$fix_file"
         fi
     done
@@ -352,7 +415,9 @@ FIX_RULES_EOF
 VERIFY_STATIC_EOF
         } > "$ac_file"
         local verify_output verify_exit=0
+        protect_pipeline_files
         verify_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$ac_file" 2>&1) || verify_exit=$?
+        unprotect_pipeline_files
         rm -f "$ac_file"
         echo "$verify_output" | tee -a "$log_file"
 
@@ -379,13 +444,23 @@ VERIFY_STATIC_EOF
 修复后运行测试确认通过，并准备再次接受独立验收。
 AC_FIX_STATIC_EOF
         } > "$ac_fix_file"
+        protect_pipeline_files
         claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
             < "$ac_fix_file" 2>&1 | tee -a "$log_file"
+        unprotect_pipeline_files
         rm -f "$ac_fix_file"
 
         # 修复后重跑测试；失败则继续下一轮自修复，不允许带病通过
         cd "$PROJECT_ROOT"
-        if ! {TEST_CMD} 2>&1 | tee -a "$log_file"; then
+        local ac_test_exit=0
+        if [ -n "$TIMEOUT_CMD" ]; then
+            $TIMEOUT_CMD "$test_timeout" {TEST_CMD} 2>&1 | tee -a "$log_file" || ac_test_exit=$?
+        else
+            {TEST_CMD} 2>&1 | tee -a "$log_file" || ac_test_exit=$?
+        fi
+        if [ $ac_test_exit -eq 124 ]; then
+            log_fail "验收修复后测试超时 (>${test_timeout}s)，疑似交互式测试阻塞"; return 1
+        elif [ $ac_test_exit -ne 0 ]; then
             log_warn "Card $card_id 验收修复后测试仍失败，将继续自动修复"
         fi
     done
@@ -419,8 +494,10 @@ run_phase_gate() {
                     printf '%s\n' "$gate_output"
                     echo "读取设计文档和测试确认正确行为。只修复问题，不做额外改动。"
                 } > "$gate_fix_file"
+                protect_pipeline_files
                 claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
                     < "$gate_fix_file" 2>&1 | tee -a "$log_file" || true
+                unprotect_pipeline_files
                 rm -f "$gate_fix_file"
             fi
         done
@@ -438,8 +515,10 @@ run_phase_gate() {
         echo "已完成的 Card:"
         grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/^CARD:/- /' || echo "（无）"
     } > "$gate_audit_file"
+    protect_pipeline_files
     claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
         < "$gate_audit_file" 2>&1 | tee -a "$log_file" || true
+    unprotect_pipeline_files
     rm -f "$gate_audit_file"
     log_ok "Phase Gate $phase 完成"
 
@@ -585,6 +664,9 @@ main() {
 
     mkdir -p "$LOGS_DIR"
     touch "$STATE_FILE"
+
+    # 异常退出时恢复文件权限（防止 chmod 444 残留）
+    trap 'unprotect_pipeline_files 2>/dev/null; rm -f "${STATE_FILE}.bak.$$" 2>/dev/null' EXIT INT TERM
 
     # 记录 Pipeline 起点（用于最终 summary diff）
     PIPELINE_BASELINE=$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
@@ -772,10 +854,22 @@ with open(decisions_path, "a") as f:
 - 检测应走 AI-REVIEW 但只走了 SPEC-DECISION 的遗漏
 - `build_prompt()` 自动将已有记录注入后续 Card 的 prompt，提供前序决策上下文
 
-## 禁止事项
+## 禁止事项（安全边界 — 违反将导致 Pipeline 回滚）
+
+### 范围边界（最高优先级）
+- ❌ **严禁实现当前 Card 以外的任何功能** — 你只负责当前 Card 的验收标准，不要"顺便"做其他 Card 的工作
+- ❌ **严禁读取 cards/ 目录下其他 Card 文件** — 你不需要知道后续 Card 的内容，也不应提前实现
+- ❌ **严禁修改 Autodev/ 目录下的任何文件** — 包括 state, decisions.jsonl 以外的文件、autodev.sh、system_prompt.md、gate_check.sh、cards/*.md（state 和 autodev.sh 在执行期间为只读，写入会报错）
+- ❌ **严禁写入 state 文件** — 进度管理完全由 autodev.sh 控制，不是你的职责
+
+### 实现约束
 - ❌ 添加设计文档未描述的功能
 - ❌ 跳过测试
-- ❌ 修改 Autodev/ 下的文件
+- ❌ 修改其他 Card 已实现的代码（除非当前 Card 明确要求）
+
+### decisions.jsonl 例外
+- ✅ 你**可以且应该** append 到 decisions.jsonl（记录 SPEC-DECISION / AI-REVIEW）
+- ❌ 但**不可**删除或覆盖 decisions.jsonl 的已有内容
 {PROJECT_SPECIFIC_PROHIBITIONS}
 
 ## Skill 使用规则
@@ -959,9 +1053,10 @@ After generating all files:
 1. **Todolist is the source of truth** — every Card traces back to todolist tasks
 2. **P1/P2 fixes become constraints** — embed audit corrections into Card acceptance criteria
 3. **Test command is sacred** — must match what the todolist specifies
-4. **Backward compatibility** — if todolist mentions fallback/compatibility, enforce in gate checks
-5. **No gold-plating** — Cards only implement what the todolist describes
-6. **Each Card is self-contained** — reads its own context, doesn't assume prior Card output was read
+4. **Test command must be non-interactive** — the generated test command must run fully unattended with no stdin prompts. Scan the test directory for interactive tests (input(), getpass(), wallet prompts, manual e2e) and add --ignore flags to exclude them. A test command that hangs waiting for input will block the entire pipeline.
+5. **Backward compatibility** — if todolist mentions fallback/compatibility, enforce in gate checks
+6. **No gold-plating** — Cards only implement what the todolist describes
+7. **Each Card is self-contained** — reads its own context, doesn't assume prior Card output was read
 
 ## Generator Self-Check
 
