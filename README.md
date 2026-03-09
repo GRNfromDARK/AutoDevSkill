@@ -125,6 +125,10 @@ AutoDevSkill/
 
 ## Changelog
 
+### v1.3 (2026-03-09)
+
+- **Fix**: Acceptance verification (AC) retry limit increased from 3 to 10 — independent acceptance verifier now has more attempts to self-heal before failing. Configurable via `{ENV_PREFIX}_AC_RETRIES` env var (default: 10).
+
 ### v1.2 (2026-03-06)
 
 - **Fix**: Test retry limit increased from 3 to 10 — template was incorrectly reusing `GATE_MAX_RETRIES` (default 3) for the test loop instead of a dedicated `TEST_MAX_RETRIES` variable. Now configurable via `{ENV_PREFIX}_TEST_RETRIES` env var (default: 10).
