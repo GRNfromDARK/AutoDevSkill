@@ -128,6 +128,7 @@ AutoDevSkill/
 ### v1.3 (2026-03-09)
 
 - **Fix**: Acceptance verification (AC) retry limit increased from 3 to 10 — independent acceptance verifier now has more attempts to self-heal before failing. Configurable via `{ENV_PREFIX}_AC_RETRIES` env var (default: 10).
+- **Fix**: Gate check retry limit increased from 3 to 10 — gate script (lint/format/type-check) now has more attempts to auto-fix before failing. Configurable via `{ENV_PREFIX}_GATE_RETRIES` env var (default: 10).
 
 ### v1.2 (2026-03-06)
 
