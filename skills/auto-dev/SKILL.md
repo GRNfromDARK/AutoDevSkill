@@ -640,6 +640,10 @@ run_bug_hunt() {
         cd "$PROJECT_ROOT"
         local git_diff_files
         git_diff_files=$({ git diff --name-only "$diff_ref" 2>/dev/null; git diff --name-only 2>/dev/null; } | sort -u)
+        if [ -z "$git_diff_files" ]; then
+            log_warn "无变更文件，跳过 Bug Hunt"
+            break
+        fi
         local summary_content=""
         [ -f "$SUMMARY_FILE" ] && summary_content=$(cat "$SUMMARY_FILE")
         local requirements_content=""
@@ -653,12 +657,16 @@ $(cat "$card_file")
             cat <<'BH_SCAN_STATIC_1'
 你是独立 Bug 审计员（不是开发者）。你的任务是对已完成的代码进行全面 Bug 扫描。
 
+## 重要约束
+- 你只有只读权限。不要修改、创建或删除任何文件。只读取和报告。
+- 只报告真实存在的 bug，不要报告代码风格问题。
+- 不要猜测或假设 bug，必须有源代码中的具体证据。
+
 ## 扫描方法
 1. 读取下面列出的所有变更文件的源代码
 2. 对照原始需求（Cards），逐一检查功能是否正确实现
 3. 检查边界条件、错误处理、类型安全、安全漏洞
 4. 检查现有测试的覆盖是否充分
-5. 只报告真实存在的 bug，不要报告代码风格问题
 
 ## Bug 分级标准
 - **P0**: 崩溃、数据丢失、安全漏洞、核心功能完全不可用
@@ -675,6 +683,14 @@ BH_SCAN_STATIC_1
             echo "## 原始需求（Cards）"
             printf '%s\n' "$requirements_content"
             echo ""
+            # 注入前几轮 bug 报告，防止重复报告已修复的 bug
+            if [ $round -gt 1 ]; then
+                echo "## 前几轮已发现并处理的 Bug（不要重复报告这些已修复的 bug）"
+                for prev_rf in "$BUG_REPORTS_DIR"/bug_report_round_*.md; do
+                    [ -f "$prev_rf" ] && { echo "--- $(basename "$prev_rf") ---"; cat "$prev_rf"; echo ""; }
+                done
+                echo ""
+            fi
             cat <<'BH_SCAN_STATIC_2'
 ## 输出格式（严格遵守）
 
@@ -697,7 +713,10 @@ VERDICT: NO_BUGS_FOUND
 
 VERDICT: BUGS_FOUND | P0:数量 P1:数量 P2:数量
 
-重要：你是独立审计员。直接读源文件来验证，不要信任之前的 AI 输出。只报告有充分证据的真实 bug。
+重要：
+- 你是独立审计员。直接读源文件来验证，不要信任之前的 AI 输出。
+- 只报告有充分证据的真实 bug。
+- 不要重复报告前几轮已发现并修复的 bug，只报告当前代码中仍然存在的新问题。
 BH_SCAN_STATIC_2
         } > "$scan_file"
 
@@ -730,6 +749,12 @@ BH_SCAN_STATIC_2
             log_info "Bug Fix (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
             local fix_file; fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_fix.XXXXXX")
             {
+                # 重试时注入上一轮 verify 反馈，帮助开发者理解哪些修复不充分
+                if [ $fix_attempt -gt 1 ] && [ -n "${verify_output:-}" ]; then
+                    echo "## 上一次修复的验证结果（请特别关注 NOT_FIXED 和 PARTIAL 的项目）"
+                    printf '%s\n' "$verify_output"
+                    echo ""
+                fi
                 echo "以下是独立审计员发现的 bug 报告："
                 echo ""
                 printf '%s\n' "$scan_output"
@@ -743,6 +768,9 @@ BH_SCAN_STATIC_2
 
 ## 规则
 - 每个 bug 必须有对应的回归测试
+- 回归测试放在项目现有的测试文件中（或与被修复代码相邻的测试文件中）
+- 测试命名以 test_bug_ 或 test_regression_ 为前缀，便于识别
+- 使用项目现有的测试框架和模式
 - 不能破坏现有测试（向后兼容）
 - 修复后运行测试确认全部通过
 - 只修复报告中列出的 bug，不要做额外重构
@@ -782,6 +810,9 @@ BH_FIX_STATIC_EOF
                     {
                         echo "Bug Hunt 修复后测试失败，请修复。"
                         echo ""
+                        echo "## 当前正在修复的 Bug 报告（参考上下文）"
+                        printf '%s\n' "$scan_output"
+                        echo ""
                         echo "## 测试输出"
                         echo '```'
                         printf '%s\n' "$test_output"
@@ -790,6 +821,8 @@ BH_FIX_STATIC_EOF
                         cat <<'BH_TFIX_RULES_EOF'
 ## 规则
 - 读取失败的测试文件和对应的实现代码
+- 如果不确定测试的预期行为，读取上面的 bug 报告和需求文档来确认
+- 优先修复实现代码而非修改测试的预期值（除非测试本身有错误）
 - 修复后运行: {TEST_CMD}
 - 只修复导致测试失败的问题，不要做额外改动
 - 不能破坏现有测试
@@ -813,23 +846,28 @@ BH_TFIX_RULES_EOF
             log_info "验证 Bug 修复 (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
             local verify_file; verify_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_verify.XXXXXX")
             {
-                echo "你是独立审计员。以下是之前发现的 bug 报告："
+                echo "你是独立审计员（只读角色，不要修改任何文件）。以下是之前发现的 bug 报告："
                 echo ""
                 printf '%s\n' "$scan_output"
                 echo ""
                 cat <<'BH_VERIFY_STATIC_EOF'
+## 重要约束
+- 你只有只读权限。不要修改、创建或删除任何文件。只读取和验证。
+
 ## 你的任务
-1. 逐一检查报告中的每个 bug 是否已被修复
-2. 检查每个 bug 是否有对应的回归测试
+1. 逐一检查报告中的每个 bug 是否已被修复（读取源文件确认）
+2. 检查每个 bug 是否有对应的回归测试，且该测试确实能覆盖修复的场景（不是空壳测试）
 3. 运行测试确认通过: {TEST_CMD}
 4. 检查修复是否引入了新的问题
 
 ## 输出格式（严格遵守）
 BUG-1: FIXED — 说明 | 回归测试: YES/NO
-BUG-2: FIXED — 说明 | 回归测试: YES/NO
+BUG-2: PARTIAL — 主要场景已修复但边界条件仍存在 | 回归测试: YES/NO
 BUG-3: NOT_FIXED — 说明
 ...
 VERDICT: ALL_FIXED | HAS_UNFIXED
+
+说明：PARTIAL 视为未修复，计入 HAS_UNFIXED。
 
 重要：直接读源文件和测试文件来验证，不要信任之前的 AI 输出。
 BH_VERIFY_STATIC_EOF
@@ -860,23 +898,22 @@ BH_VERIFY_STATIC_EOF
         log_warn "请查看最新报告: $BUG_REPORTS_DIR/bug_report_round_${round}.md"
     fi
 
-    # 更新 summary.md，追加 Bug Hunt 结果
+    # 更新 summary.md，追加 Bug Hunt 结果（只生成新章节，追加写入，防止丢失原始内容）
     log_info "更新 summary.md，追加 Bug Hunt 结果..."
+    if [ ! -f "$SUMMARY_FILE" ]; then
+        log_warn "summary.md 不存在，跳过 Bug Hunt 结果追加"
+        return 0
+    fi
     local bh_summary_file; bh_summary_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_summary.XXXXXX")
     {
-        echo "请在以下 summary.md 末尾追加一个 '## Bug Hunt 结果' 章节。"
-        echo ""
-        echo "## 当前 summary.md"
-        cat "$SUMMARY_FILE"
-        echo ""
-        echo "## Bug Hunt 报告"
+        echo "## Bug Hunt 报告数据"
         echo "总轮次: $round"
         for rf in "$BUG_REPORTS_DIR"/bug_report_round_*.md; do
             [ -f "$rf" ] && { echo "--- $(basename "$rf") ---"; cat "$rf"; echo ""; }
         done
         echo ""
         cat <<'BH_SUMMARY_STATIC_EOF'
-请追加以下格式到 summary.md 末尾：
+请根据上面的 Bug Hunt 报告数据，只输出一个新的 Markdown 章节（不要包含已有的 summary 内容）。格式如下：
 
 ## Bug Hunt 结果
 - 扫描轮次: N
@@ -888,14 +925,14 @@ BH_VERIFY_STATIC_EOF
 | Bug ID | 优先级 | 描述 | 状态 |
 |--------|--------|------|------|
 
-直接输出完整的更新后的 summary.md（不需要代码块包裹）。
+重要：只输出上面这个章节的 Markdown 内容。不要输出其他内容，不要用代码块包裹。
 BH_SUMMARY_STATIC_EOF
     } > "$bh_summary_file"
-    local updated_summary
-    updated_summary=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$bh_summary_file" 2>&1) || true
+    local bh_section
+    bh_section=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$bh_summary_file" 2>>"$LOGS_DIR/bug_hunt_summary.log") || true
     rm -f "$bh_summary_file"
-    echo "$updated_summary" > "$SUMMARY_FILE"
-    log_ok "summary.md 已更新（含 Bug Hunt 结果）"
+    { echo ""; echo "$bh_section"; } >> "$SUMMARY_FILE"
+    log_ok "summary.md 已更新（追加 Bug Hunt 结果）"
 }
 
 # ──── CLI ────
