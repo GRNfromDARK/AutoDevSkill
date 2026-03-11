@@ -626,9 +626,21 @@ SUMMARY_STATIC_2
 
 # ──── Bug Hunt Phase: 多轮 Bug 扫描 + 修复 + 回归测试 ────
 run_bug_hunt() {
+    # 如果 Bug Hunt 已完成（前次运行），跳过
+    if is_completed "BUG_HUNT_DONE"; then
+        log_info "Bug Hunt 已完成（跳过）"
+        return 0
+    fi
+
     log_title "Bug Hunt Phase 启动"
     local diff_ref="${PIPELINE_BASELINE:-HEAD}"
+
+    # 断点续跑：从已完成的最大轮次 +1 开始
     local round=0
+    while is_completed "BUG_HUNT_ROUND:$((round + 1))"; do
+        round=$((round + 1))
+        log_info "跳过已完成: Bug Hunt Round $round"
+    done
 
     while [ $round -lt $BUG_HUNT_MAX_ROUNDS ]; do
         round=$((round + 1))
@@ -648,7 +660,12 @@ run_bug_hunt() {
         [ -f "$SUMMARY_FILE" ] && summary_content=$(cat "$SUMMARY_FILE")
         local requirements_content=""
         for card_file in "$CARDS_DIR"/*.md; do
-            [ -f "$card_file" ] && requirements_content="${requirements_content}
+            [ -f "$card_file" ] || continue
+            # 排除非 Card 文件（如 phase_gate.md 门禁模板）
+            case "$(basename "$card_file")" in
+                phase_gate.md) continue ;;
+            esac
+            requirements_content="${requirements_content}
 --- $(basename "$card_file") ---
 $(cat "$card_file")
 "
@@ -722,7 +739,7 @@ BH_SCAN_STATIC_2
 
         log_info "Bug Scan 中 (VERIFY_MODEL: $VERIFY_MODEL)..."
         local scan_output scan_exit=0
-        scan_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$scan_file" 2>&1) || scan_exit=$?
+        scan_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$scan_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || scan_exit=$?
         rm -f "$scan_file"
         echo "$scan_output" > "$report_file"
         log_ok "Bug 报告已保存: $report_file"
@@ -730,6 +747,7 @@ BH_SCAN_STATIC_2
         # ──── [2] 判断：有 P0/P1/P2？ ────
         if [ $scan_exit -eq 0 ] && echo "$scan_output" | grep -q "VERDICT: NO_BUGS_FOUND"; then
             log_ok "Bug Hunt 完成 — Round $round 未发现新 bug"
+            mark_completed "BUG_HUNT_ROUND:$round"
             break
         fi
 
@@ -874,7 +892,7 @@ BH_VERIFY_STATIC_EOF
             } > "$verify_file"
             local verify_output verify_exit=0
             protect_pipeline_files
-            verify_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$verify_file" 2>&1) || verify_exit=$?
+            verify_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$verify_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || verify_exit=$?
             unprotect_pipeline_files
             rm -f "$verify_file"
             echo "$verify_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
@@ -891,6 +909,7 @@ BH_VERIFY_STATIC_EOF
         if [ "$all_fixed" != true ]; then
             log_warn "Round $round: 经 $AC_MAX_RETRIES 次修复仍有未解决的 bug，进入下一轮全量扫描"
         fi
+        mark_completed "BUG_HUNT_ROUND:$round"
     done
 
     if [ $round -ge $BUG_HUNT_MAX_ROUNDS ]; then
@@ -933,6 +952,7 @@ BH_SUMMARY_STATIC_EOF
     rm -f "$bh_summary_file"
     { echo ""; echo "$bh_section"; } >> "$SUMMARY_FILE"
     log_ok "summary.md 已更新（追加 Bug Hunt 结果）"
+    mark_completed "BUG_HUNT_DONE"
 }
 
 # ──── CLI ────
@@ -969,7 +989,7 @@ main() {
         case $1 in
             --from)     start_from="$2"; shift 2 ;;
             --model)    MODEL="$2"; shift 2 ;;
-            --reset)    rm -f "$STATE_FILE"; log_info "进度已清除"; shift ;;
+            --reset)    rm -f "$STATE_FILE"; rm -rf "$BUG_REPORTS_DIR"/*.md 2>/dev/null; log_info "进度已清除（含 Bug Hunt 报告）"; shift ;;
             --dry-run)  dry_run=true; shift ;;
             --status)   show_status; exit 0 ;;
             --help)     show_help; exit 0 ;;
