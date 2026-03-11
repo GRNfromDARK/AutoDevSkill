@@ -129,7 +129,23 @@ AutoDevSkill/
 
 ### v1.4 (2026-03-11)
 
-- **Feature**: Bug Hunt phase — after development completes and summary.md is generated, an independent AI auditor scans all code against original requirements to find P0/P1/P2 bugs. Developer AI fixes each bug with regression tests. Loops until no new P2+ bugs found (max 15 rounds). Inner fix-verify retries reuse `AC_MAX_RETRIES` (default 10). Configurable via `{ENV_PREFIX}_BUG_HUNT_ROUNDS` env var.
+- **Feature**: Bug Hunt phase — after all cards complete and summary.md is generated, a multi-round bug scanning + fixing loop runs automatically:
+  1. **Bug Scan** (VERIFY_MODEL, read-only auditor) — scans all changed code against original requirements, finds P0/P1/P2 bugs
+  2. **Bug Fix** (MODEL, developer) — fixes all reported bugs + writes regression tests for each
+  3. **Test Verify** — runs full test suite with auto-repair (reuses `TEST_MAX_RETRIES`)
+  4. **Fix Verify** (VERIFY_MODEL, auditor) — independently verifies each fix + regression test quality
+  5. Loops until scanner reports `NO_BUGS_FOUND` or max rounds reached
+  - Inner fix-verify retries reuse `AC_MAX_RETRIES` (default 10)
+  - Outer scan rounds: `{ENV_PREFIX}_BUG_HUNT_ROUNDS` (default 15)
+  - Bug reports saved to `bug_reports/bug_report_round_N.md`
+  - Results appended to `summary.md` at completion
+- **Prompt quality**: 5 prompt optimizations for Bug Hunt agents:
+  - Summary Update uses append mode (prevents data loss from AI hallucination)
+  - Bug Scan injects previous rounds' reports (prevents re-reporting fixed bugs)
+  - Bug Fix includes verify feedback on retries + regression test placement guidance
+  - Fix Verify checks test quality (not just existence) + supports PARTIAL status
+  - Auditor prompts enforce read-only constraint; Test Fix includes bug context
+- **Robustness**: stderr separated from AI response in Bug Scan and Fix Verify (prevents verbose noise in reports); `--reset` clears `bug_reports/`; `phase_gate.md` excluded from requirements context; Bug Hunt state tracked in state file (`BUG_HUNT_ROUND:N` + `BUG_HUNT_DONE`) for crash recovery
 
 ### v1.3 (2026-03-09)
 
@@ -229,3 +245,22 @@ pytest tests/ -q
 | L3 | AI-GATE | 阶段边界 | gate_check.sh + AI 审计 |
 
 所有决策记录在 `decisions.jsonl` 中，后续 Card 可自动获取前序决策上下文。
+
+## Bug Hunt 阶段
+
+开发完成后自动进入 Bug Hunt，确保交付可运行的代码：
+
+```
+所有 Card 完成 → summary.md → Bug Hunt 多轮循环 → 最终交付
+```
+
+| 步骤 | 角色 | 说明 |
+|------|------|------|
+| Bug Scan | 独立审计员（只读） | 扫描代码 + 对照需求，找出 P0/P1/P2 bug |
+| Bug Fix | 开发者 AI | 修复 bug + 编写回归测试 |
+| 测试验证 | 自动 | 运行全量测试，失败自动修复 |
+| Fix Verify | 独立审计员（只读） | 验证修复 + 检查回归测试质量 |
+
+- 无新 bug → 退出循环
+- 默认最多 15 轮（`{ENV_PREFIX}_BUG_HUNT_ROUNDS`）
+- 支持断点续跑（crash 后从上次完成的轮次继续）
