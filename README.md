@@ -41,8 +41,8 @@ generate autodev pipeline
 ## Pipeline Positioning
 
 ```
-auto-requirement → auto-todo → auto-dev
-(产品决策层)         (工程任务层)   (代码实现层)
+auto-requirement → auto-todo → auto-dev → [Bug Hunt]
+(产品决策层)         (工程任务层)   (代码实现层)  (质量保障层)
 ```
 
 This skill handles **code implementation** — generating automated TDD pipelines from task lists. Product decisions and task decomposition are handled by upstream skills.
@@ -56,6 +56,7 @@ This skill handles **code implementation** — generating automated TDD pipeline
 - **3-level decision protocol** — SPEC-DECISION (self), AI-REVIEW (peer), AI-GATE (phase boundary)
 - **Decision audit trail** — All decisions logged to `decisions.jsonl` for cross-card traceability
 - **Resumable execution** — State file tracks progress; resume from any card with `--from`
+- **Bug Hunt phase** — multi-round P0/P1/P2 bug scanning after development, with auto-fix + regression tests
 
 ## How It Works
 
@@ -74,6 +75,7 @@ Autodev/{project}/
 ├── gate_check.sh       # Automated gate checks
 ├── state               # Progress tracker
 ├── decisions.jsonl     # Decision audit trail
+├── bug_reports/        # Bug Hunt reports per round
 ├── logs/               # Runtime logs
 └── cards/
     ├── A.1.md          # Task cards
@@ -124,6 +126,10 @@ AutoDevSkill/
 ```
 
 ## Changelog
+
+### v1.4 (2026-03-11)
+
+- **Feature**: Bug Hunt phase — after development completes and summary.md is generated, an independent AI auditor scans all code against original requirements to find P0/P1/P2 bugs. Developer AI fixes each bug with regression tests. Loops until no new P2+ bugs found (max 15 rounds). Inner fix-verify retries reuse `AC_MAX_RETRIES` (default 10). Configurable via `{ENV_PREFIX}_BUG_HUNT_ROUNDS` env var.
 
 ### v1.3 (2026-03-09)
 
