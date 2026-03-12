@@ -177,6 +177,15 @@ Autodev/{project_name}/
 # ═══════════════════════════════════════════════════════════
 set -euo pipefail
 
+# ──── pipefail 安全规则 ────
+# CRITICAL: `set -euo pipefail` 要求所有管道命令都有错误保护。
+# 以下命令在无匹配/空输入时返回非零，必须加 `|| true` 或 `|| echo <default>`:
+#   - grep（无匹配返回 1）→ 用于赋值时必须 `|| true`
+#   - git diff --name-only（空 diff 返回 1）→ 管道中必须 `|| true`
+#   - ls *.ext（无匹配时 glob 展开失败）→ 管道中必须 `|| true`
+#   - wc -l | tr -d ' '（上游失败传播）→ 管道末端加 `|| echo 0`
+# 规则: $() 内任何 grep/git diff/ls 管道 → 末尾加 `|| true` 或 `|| echo <default>`
+
 # ──── 路径配置 ────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -239,7 +248,7 @@ log_title() {
 is_completed() { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
 mark_completed() { echo "$1" >> "$STATE_FILE"; log_ok "完成: $1"; }
 get_completed_count() {
-    if [ -f "$STATE_FILE" ]; then wc -l < "$STATE_FILE" | tr -d ' '
+    if [ -f "$STATE_FILE" ]; then wc -l < "$STATE_FILE" | tr -d ' ' || echo "0"
     else echo "0"; fi
 }
 
@@ -425,7 +434,7 @@ VERIFY_STATIC_EOF
         rm -f "$ac_file"
         echo "$verify_output" | tee -a "$log_file"
 
-        if [ $verify_exit -eq 0 ] && echo "$verify_output" | grep -q "VERDICT: ALL_PASS"; then
+        if [ $verify_exit -eq 0 ] && (echo "$verify_output" | grep -q "VERDICT: ALL_PASS"); then
             log_ok "验收验证通过"
             ac_passed=true
             break
@@ -535,23 +544,28 @@ run_phase_gate() {
 generate_summary() {
     log_title "生成 Pipeline 完成总结"
     local completed_cards
-    completed_cards=$(grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/CARD://' | tr '\n' ', ' | sed 's/,$//')
+    completed_cards=$(grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/CARD://' | tr '\n' ', ' | sed 's/,$//' || true)
     local completed_gates
-    completed_gates=$(grep "^GATE:" "$STATE_FILE" 2>/dev/null | sed 's/GATE://' | tr '\n' ', ' | sed 's/,$//')
+    completed_gates=$(grep "^GATE:" "$STATE_FILE" 2>/dev/null | sed 's/GATE://' | tr '\n' ', ' | sed 's/,$//' || true)
 
     # 对比 Pipeline 启动时的 baseline（含已提交 + 未提交的全部变更）
     local diff_ref="${PIPELINE_BASELINE:-HEAD}"
     local git_diff_stat git_diff_files
     cd "$PROJECT_ROOT"
-    git_diff_stat=$(git diff --stat "$diff_ref" 2>/dev/null || echo "(no git changes)")
-    # 已提交的变更 + 未提交的变更
-    git_diff_files=$({ git diff --name-only "$diff_ref" 2>/dev/null; git diff --name-only 2>/dev/null; } | sort -u)
+    # 优先用 git diff；非 git 项目回退到扫描源文件
+    if git rev-parse --git-dir >/dev/null 2>&1; then
+        git_diff_stat=$(git diff --stat "$diff_ref" 2>/dev/null || echo "(no git changes)")
+        git_diff_files=$({ git diff --name-only "$diff_ref" 2>/dev/null || true; git diff --name-only 2>/dev/null || true; } | sort -u || true)
+    else
+        git_diff_stat="(not a git repository)"
+        git_diff_files=$(find src/ -name "*.ts" -o -name "*.py" -o -name "*.js" -o -name "*.rs" -o -name "*.go" 2>/dev/null | grep -v node_modules | sort || true)
+    fi
     local decisions_content=""
     if [ -f "$DECISIONS_FILE" ] && [ -s "$DECISIONS_FILE" ]; then
         decisions_content=$(cat "$DECISIONS_FILE")
     fi
     local log_files
-    log_files=$(ls -1t "$LOGS_DIR"/*.log 2>/dev/null | head -20)
+    log_files=$(ls -1t "$LOGS_DIR"/*.log 2>/dev/null | head -20 || true)
 
     local summary_file_prompt; summary_file_prompt=$(mktemp "${TMPDIR:-/tmp}/autodev_summary.XXXXXX")
     {
@@ -651,7 +665,12 @@ run_bug_hunt() {
         local scan_file; scan_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_scan.XXXXXX")
         cd "$PROJECT_ROOT"
         local git_diff_files
-        git_diff_files=$({ git diff --name-only "$diff_ref" 2>/dev/null; git diff --name-only 2>/dev/null; } | sort -u)
+        # 优先用 git diff；非 git 项目回退到扫描源文件
+        if git rev-parse --git-dir >/dev/null 2>&1; then
+            git_diff_files=$({ git diff --name-only "$diff_ref" 2>/dev/null || true; git diff --name-only 2>/dev/null || true; } | sort -u || true)
+        else
+            git_diff_files=$(find src/ -name "*.ts" -o -name "*.py" -o -name "*.js" -o -name "*.rs" -o -name "*.go" 2>/dev/null | grep -v node_modules | sort || true)
+        fi
         if [ -z "$git_diff_files" ]; then
             log_warn "无变更文件，跳过 Bug Hunt"
             break
@@ -745,7 +764,7 @@ BH_SCAN_STATIC_2
         log_ok "Bug 报告已保存: $report_file"
 
         # ──── [2] 判断：有 P0/P1/P2？ ────
-        if [ $scan_exit -eq 0 ] && echo "$scan_output" | grep -q "VERDICT: NO_BUGS_FOUND"; then
+        if [ $scan_exit -eq 0 ] && (echo "$scan_output" | grep -q "VERDICT: NO_BUGS_FOUND"); then
             log_ok "Bug Hunt 完成 — Round $round 未发现新 bug"
             mark_completed "BUG_HUNT_ROUND:$round"
             break
@@ -897,7 +916,7 @@ BH_VERIFY_STATIC_EOF
             rm -f "$verify_file"
             echo "$verify_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
 
-            if [ $verify_exit -eq 0 ] && echo "$verify_output" | grep -q "VERDICT: ALL_FIXED"; then
+            if [ $verify_exit -eq 0 ] && (echo "$verify_output" | grep -q "VERDICT: ALL_FIXED"); then
                 log_ok "所有 bug 已修复并验证"
                 all_fixed=true
                 break
@@ -989,7 +1008,7 @@ main() {
         case $1 in
             --from)     start_from="$2"; shift 2 ;;
             --model)    MODEL="$2"; shift 2 ;;
-            --reset)    rm -f "$STATE_FILE"; rm -rf "$BUG_REPORTS_DIR"/*.md 2>/dev/null; log_info "进度已清除（含 Bug Hunt 报告）"; shift ;;
+            --reset)    rm -f "$STATE_FILE" "$AUTODEV/.pipeline_baseline"; rm -rf "$BUG_REPORTS_DIR"/*.md 2>/dev/null; log_info "进度已清除（含 Bug Hunt 报告和 Pipeline 基线）"; shift ;;
             --dry-run)  dry_run=true; shift ;;
             --status)   show_status; exit 0 ;;
             --help)     show_help; exit 0 ;;
@@ -1004,8 +1023,17 @@ main() {
     # 异常退出时恢复文件权限（防止 chmod 444 残留）
     trap 'unprotect_pipeline_files 2>/dev/null; rm -f "${STATE_FILE}.bak.$$" 2>/dev/null' EXIT INT TERM
 
-    # 记录 Pipeline 起点（用于最终 summary diff）
-    PIPELINE_BASELINE=$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+    # 持久化 Pipeline 基线：只在首次运行时记录，续跑时读取原始基线
+    local baseline_file="$AUTODEV/.pipeline_baseline"
+    if [ -f "$baseline_file" ]; then
+        PIPELINE_BASELINE=$(cat "$baseline_file")
+    elif git rev-parse --git-dir >/dev/null 2>&1; then
+        PIPELINE_BASELINE=$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+        echo "$PIPELINE_BASELINE" > "$baseline_file"
+    else
+        PIPELINE_BASELINE=""
+        echo "" > "$baseline_file"
+    fi
 
     log_title "{PROJECT_DISPLAY_NAME} — Pipeline 启动"
     log_info "Model: $MODEL | Progress: $(get_completed_count)/${#ALL_STEPS[@]}"
@@ -1290,8 +1318,8 @@ echo "════════════════════════�
 # 3. SPEC-DECISION / AI-REVIEW 审计
 echo ""
 echo "── 决策审计 ──"
-spec_count=$(grep -r "SPEC-DECISION" {SOURCE_DIRS} 2>/dev/null | wc -l | tr -d ' ')
-review_count=$(grep -r "AI-REVIEW" {SOURCE_DIRS} 2>/dev/null | wc -l | tr -d ' ')
+spec_count=$(grep -r "SPEC-DECISION" {SOURCE_DIRS} 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+review_count=$(grep -r "AI-REVIEW" {SOURCE_DIRS} 2>/dev/null | wc -l | tr -d ' ' || echo 0)
 echo "  SPEC-DECISION 标注: $spec_count 处"
 echo "  AI-REVIEW 标注: $review_count 处"
 
@@ -1300,11 +1328,11 @@ echo "  AI-REVIEW 标注: $review_count 处"
 if [ -f "$AUTODEV_DIR/decisions.jsonl" ] && [ -s "$AUTODEV_DIR/decisions.jsonl" ]; then
     block_count=$(grep -c '"severity": *"BLOCK"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null || echo 0)
     warn_count=$(grep -c '"severity": *"WARN"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null || echo 0)
-    total_decisions=$(wc -l < "$AUTODEV_DIR/decisions.jsonl" | tr -d ' ')
+    total_decisions=$(wc -l < "$AUTODEV_DIR/decisions.jsonl" | tr -d ' ' || echo 0)
     review_decisions=$(grep -c '"level": *"AI-REVIEW"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null || echo 0)
     echo "  decisions.jsonl: $total_decisions 条记录 (AI-REVIEW: $review_decisions, BLOCK: $block_count, WARN: $warn_count)"
     # 检查是否有未解决的 BLOCK
-    unresolved_blocks=$(grep '"severity": *"BLOCK"' "$AUTODEV_DIR/decisions.jsonl" | grep '"consensus": *false' | wc -l | tr -d ' ')
+    unresolved_blocks=$(grep '"severity": *"BLOCK"' "$AUTODEV_DIR/decisions.jsonl" 2>/dev/null | grep '"consensus": *false' | wc -l | tr -d ' ' || echo 0)
     if [ "$unresolved_blocks" -gt 0 ]; then
         check_fail "存在 $unresolved_blocks 个未达成共识的 BLOCK 级决策"
     else
@@ -1319,7 +1347,7 @@ phase_base_file="$AUTODEV_DIR/.phase_baseline"
 phase_base_ref=""
 [ -f "$phase_base_file" ] && phase_base_ref=$(cat "$phase_base_file")
 if [ -n "$phase_base_ref" ] && git rev-parse --verify "${phase_base_ref}^{commit}" >/dev/null 2>&1; then
-    changed_files=$(git diff --name-only "$phase_base_ref" -- 2>/dev/null | wc -l | tr -d ' ')
+    changed_files=$(git diff --name-only "$phase_base_ref" -- 2>/dev/null | wc -l | tr -d ' ' || echo 0)
     echo "  Phase 基线: $phase_base_ref"
     phase_review_count=0
     while IFS= read -r changed_file; do
@@ -1328,7 +1356,7 @@ if [ -n "$phase_base_ref" ] && git rev-parse --verify "${phase_base_ref}^{commit
         phase_review_count=$((phase_review_count + file_review_count))
     done < <(git diff --name-only "$phase_base_ref" -- 2>/dev/null)
 else
-    changed_files=$(git diff --name-only HEAD 2>/dev/null | wc -l | tr -d ' ')
+    changed_files=$(git diff --name-only HEAD 2>/dev/null | wc -l | tr -d ' ' || echo 0)
     phase_review_count=$review_count
     check_warn "未找到有效 .phase_baseline，暂回退到工作区 diff；建议每个 Gate 成功后更新该基线"
 fi
