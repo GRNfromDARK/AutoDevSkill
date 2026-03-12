@@ -508,18 +508,6 @@ run_bug_hunt() {
         fi
         local summary_content=""
         [ -f "$SUMMARY_FILE" ] && summary_content=$(cat "$SUMMARY_FILE")
-        local requirements_content=""
-        for card_file in "$CARDS_DIR"/*.md; do
-            [ -f "$card_file" ] || continue
-            # 排除非 Card 文件（如 phase_gate.md 门禁模板）
-            case "$(basename "$card_file")" in
-                phase_gate.md) continue ;;
-            esac
-            requirements_content="${requirements_content}
---- $(basename "$card_file") ---
-$(cat "$card_file")
-"
-        done
         {
             cat <<'BH_SCAN_STATIC_1'
 你是独立 Bug 审计员（不是开发者）。你的任务是对已完成的代码进行全面 Bug 扫描。
@@ -531,7 +519,7 @@ $(cat "$card_file")
 
 ## 扫描方法
 1. 读取下面列出的所有变更文件的源代码
-2. 对照原始需求（Cards），逐一检查功能是否正确实现
+2. 对照 Pipeline 完成总结，检查功能是否正确实现
 3. 检查边界条件、错误处理、类型安全、安全漏洞
 4. 检查现有测试的覆盖是否充分
 
@@ -546,9 +534,6 @@ BH_SCAN_STATIC_1
             echo ""
             echo "## 变更的文件列表（请逐一读取源代码）"
             printf '%s\n' "$git_diff_files"
-            echo ""
-            echo "## 原始需求（Cards）"
-            printf '%s\n' "$requirements_content"
             echo ""
             # 注入前几轮 bug 报告，防止重复报告已修复的 bug
             if [ $round -gt 1 ]; then
