@@ -595,15 +595,18 @@ BH_SCAN_STATIC_2
         log_ok "Bug 报告已保存: $report_file"
 
         # ──── [2] 判断：有 P0/P1/P2？ ────
+        # ⚠️ 生成时严禁修改此处 break/continue 逻辑 ⚠️
+        # 唯一允许 break 外层循环的条件是 NO_BUGS_FOUND（全新扫描未发现 bug）。
+        # ALL_FIXED 只退出内层修复循环，外层必须继续下一轮全量扫描以确认无遗漏。
         if [ $scan_exit -eq 0 ] && (echo "$scan_output" | grep -q "VERDICT: NO_BUGS_FOUND"); then
             log_ok "Bug Hunt 完成 — Round $round 未发现新 bug"
             mark_completed "BUG_HUNT_ROUND:$round"
-            break
+            break  # ← 唯一合法的外层 break：扫描确认无 bug
         fi
 
         if [ $scan_exit -ne 0 ]; then
             log_warn "Bug Scan AI 异常退出 (exit: $scan_exit)，跳过本轮继续下一轮"
-            continue
+            continue  # ← 不标记完成，不 break，仅跳过本轮
         fi
 
         log_warn "发现 bug，进入修复流程"
@@ -760,6 +763,9 @@ BH_VERIFY_STATIC_EOF
             log_warn "Round $round: 经 $AC_MAX_RETRIES 次修复仍有未解决的 bug，进入下一轮全量扫描"
         fi
         mark_completed "BUG_HUNT_ROUND:$round"
+        # ⚠️ 此处严禁添加 break ⚠️
+        # ALL_FIXED=true 不能跳出外层循环！必须回到下一轮 Bug Scan 做全新扫描，
+        # 只有扫描返回 NO_BUGS_FOUND 才能退出。否则修复可能引入新 bug 而被遗漏。
     done
 
     if [ $round -ge $BUG_HUNT_MAX_ROUNDS ]; then
