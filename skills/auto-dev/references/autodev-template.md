@@ -277,11 +277,14 @@ VERIFY_STATIC_EOF
             log_warn "验收验证发现未满足的 AC，触发修复"
         fi
 
+        # 只提取结构化判定（AC-N: PASS/FAIL + VERDICT），丢弃 verbose 噪音，防止 prompt 膨胀
+        local verify_summary
+        verify_summary=$(printf '%s\n' "$verify_output" | grep -E "^AC-|^VERDICT:" || printf '%s\n' "$verify_output" | tail -20)
         local ac_fix_file; ac_fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_acfix.XXXXXX")
         {
             echo "验收审计发现以下 AC 未满足："
             echo ""
-            printf '%s\n' "$verify_output"
+            printf '%s\n' "$verify_summary"
             echo ""
             cat <<'AC_FIX_STATIC_EOF'
 请修复未通过的验收标准。只修复未通过的项，不要改动已通过的部分。
@@ -606,9 +609,12 @@ BH_SCAN_STATIC_2
             local fix_file; fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_fix.XXXXXX")
             {
                 # 重试时注入上一轮 verify 反馈，帮助开发者理解哪些修复不充分
+                # 只提取结构化判定（BUG-N: status + VERDICT），丢弃 verbose 噪音，防止 prompt 膨胀
                 if [ $fix_attempt -gt 1 ] && [ -n "${verify_output:-}" ]; then
+                    local verify_summary
+                    verify_summary=$(printf '%s\n' "$verify_output" | grep -E "^BUG-|^VERDICT:" || printf '%s\n' "$verify_output" | tail -20)
                     echo "## 上一次修复的验证结果（请特别关注 NOT_FIXED 和 PARTIAL 的项目）"
-                    printf '%s\n' "$verify_output"
+                    printf '%s\n' "$verify_summary"
                     echo ""
                 fi
                 echo "以下是独立审计员发现的 bug 报告："
