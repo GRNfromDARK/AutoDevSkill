@@ -79,7 +79,7 @@ log_title() {
 is_completed() { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
 mark_completed() { echo "$1" >> "$STATE_FILE"; log_ok "完成: $1"; }
 get_completed_count() {
-    if [ -f "$STATE_FILE" ]; then wc -l < "$STATE_FILE" | tr -d ' ' || echo "0"
+    if [ -f "$STATE_FILE" ]; then grep -c "^\(CARD:\|GATE:\)" "$STATE_FILE" 2>/dev/null || echo "0"
     else echo "0"; fi
 }
 
@@ -456,7 +456,7 @@ SUMMARY_STATIC_2
     rm -f "$summary_file_prompt"
 
     # 提取 Markdown 内容写入文件
-    echo "$summary_output" > "$SUMMARY_FILE"
+    printf '%s\n' "$summary_output" > "$SUMMARY_FILE"
     log_ok "总结报告已生成: $SUMMARY_FILE"
 
     # 在终端直接展示总结
@@ -591,7 +591,7 @@ BH_SCAN_STATIC_2
         local scan_output scan_exit=0
         scan_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$scan_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || scan_exit=$?
         rm -f "$scan_file"
-        echo "$scan_output" > "$report_file"
+        printf '%s\n' "$scan_output" > "$report_file"
         log_ok "Bug 报告已保存: $report_file"
 
         # ──── [2] 判断：有 P0/P1/P2？ ────
@@ -800,7 +800,7 @@ BH_SUMMARY_STATIC_EOF
     local bh_section
     bh_section=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$bh_summary_file" 2>>"$LOGS_DIR/bug_hunt_summary.log") || true
     rm -f "$bh_summary_file"
-    { echo ""; echo "$bh_section"; } >> "$SUMMARY_FILE"
+    { echo ""; printf '%s\n' "$bh_section"; } >> "$SUMMARY_FILE"
     log_ok "summary.md 已更新（追加 Bug Hunt 结果）"
     mark_completed "BUG_HUNT_DONE"
 }
@@ -902,7 +902,9 @@ main() {
     generate_summary
     run_bug_hunt
     local elapsed=$(( ($(date +%s) - start_time) / 60 ))
-    log_title "Pipeline 完成！Cards: $cards_executed | Bug Hunt: max ${BUG_HUNT_MAX_ROUNDS} rounds | 耗时: ${elapsed}m"
+    local bug_hunt_rounds
+    bug_hunt_rounds=$(grep -c "^BUG_HUNT_ROUND:" "$STATE_FILE" 2>/dev/null || echo "0")
+    log_title "Pipeline 完成！Cards: $cards_executed | Bug Hunt: ${bug_hunt_rounds} rounds | 耗时: ${elapsed}m"
 }
 main "$@"
 ```
