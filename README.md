@@ -127,6 +127,12 @@ AutoDevSkill/
 
 ## Changelog
 
+### v1.5 (2026-03-13)
+
+- **Feature**: Bug Hunt session reuse — within each Bug Hunt round, Fix/TestFix/Verify/Retry calls reuse the same Claude session via `--resume <session_id>`, eliminating redundant file reading (~60-70% of per-round token cost). First Bug Fix captures session_id from `--output-format stream-json`; subsequent calls use `_bh_claude()` helper with automatic fallback to new session on resume failure.
+- **Robustness**: All continuation prompts are self-contained (include `scan_report` context) so fallback to new session works transparently without information loss.
+- **Fix**: `echo "$scan_output"` → `printf '%s\n' "$scan_output"` in Bug Scan VERDICT check to prevent escape sequence misinterpretation.
+
 ### v1.4 (2026-03-11)
 
 - **Feature**: Bug Hunt phase — after all cards complete and summary.md is generated, a multi-round bug scanning + fixing loop runs automatically:
@@ -264,3 +270,4 @@ pytest tests/ -q
 - 无新 bug → 退出循环
 - 默认最多 15 轮（`{ENV_PREFIX}_BUG_HUNT_ROUNDS`）
 - 支持断点续跑（crash 后从上次完成的轮次继续）
+- 同一轮内复用 Claude session（`--resume`），大幅减少重复文件读取的 token 消耗

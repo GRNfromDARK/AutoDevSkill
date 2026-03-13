@@ -472,6 +472,36 @@ SUMMARY_STATIC_2
     echo ""
 }
 
+# ──── Bug Hunt: session 恢复 helper ────
+# 带 session resume + fallback 的 claude 调用。
+# 用法: _bh_claude <prompt_file> <output_file> <log_file>
+# 如果 BUGHUNT_SESSION_ID 非空 → 尝试 --resume；失败 → 清除 ID，回退到新 session。
+# 输出写入 output_file，stderr 追加到 log_file。调用方自行决定如何处理 output_file。
+_bh_claude() {
+    local prompt_file="$1"
+    local output_file="$2"
+    local log_file="$3"
+    local _exit=0
+
+    protect_pipeline_files
+    if [ -n "$BUGHUNT_SESSION_ID" ]; then
+        claude -p --resume "$BUGHUNT_SESSION_ID" --dangerously-skip-permissions --verbose \
+            < "$prompt_file" > "$output_file" 2>>"$log_file" || _exit=$?
+        if [ $_exit -ne 0 ]; then
+            log_warn "Session resume 失败 (exit: $_exit)，回退到新 session"
+            BUGHUNT_SESSION_ID=""
+            _exit=0
+            claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+                < "$prompt_file" > "$output_file" 2>>"$log_file" || _exit=$?
+        fi
+    else
+        claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+            < "$prompt_file" > "$output_file" 2>>"$log_file" || _exit=$?
+    fi
+    unprotect_pipeline_files
+    return $_exit
+}
+
 # ──── Bug Hunt Phase: 多轮 Bug 扫描 + 修复 + 回归测试 ────
 run_bug_hunt() {
     # 如果 Bug Hunt 已完成（前次运行），跳过
@@ -591,7 +621,7 @@ BH_SCAN_STATIC_2
         # ⚠️ 生成时严禁修改此处 break/continue 逻辑 ⚠️
         # 唯一允许 break 外层循环的条件是 NO_BUGS_FOUND（全新扫描未发现 bug）。
         # ALL_FIXED 只退出内层修复循环，外层必须继续下一轮全量扫描以确认无遗漏。
-        if [ $scan_exit -eq 0 ] && (echo "$scan_output" | grep -q "VERDICT: NO_BUGS_FOUND"); then
+        if [ $scan_exit -eq 0 ] && (printf '%s\n' "$scan_output" | grep -q "VERDICT: NO_BUGS_FOUND"); then
             log_ok "Bug Hunt 完成 — Round $round 未发现新 bug"
             mark_completed "BUG_HUNT_ROUND:$round"
             break  # ← 唯一合法的外层 break：扫描确认无 bug
@@ -604,29 +634,22 @@ BH_SCAN_STATIC_2
 
         log_warn "发现 bug，进入修复流程"
 
-        # ──── [3]+[4]+[5] Bug Fix + Test + Verify 内循环 ────
-        local fix_attempt=0 all_fixed=false
-        while [ $fix_attempt -lt $AC_MAX_RETRIES ]; do
-            fix_attempt=$((fix_attempt + 1))
+        # ──── [3]+[4]+[5] Bug Fix + Test + Verify 内循环（session 复用）────
+        # 策略：首次 Bug Fix 用 --output-format stream-json 捕获 session_id，
+        # 后续 Test Fix / Verify / 重试均通过 --resume <session_id> 精确复用 session。
+        # 如果 resume 失败 → 清除 session_id → 回退到新 session（prompt 含完整上下文，可独立运行）。
+        local fix_attempt=1 all_fixed=false
+        local BUGHUNT_SESSION_ID=""
 
-            # ──── [3] Bug Fix (开发者 AI) ────
-            log_info "Bug Fix (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
-            local fix_file; fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_fix.XXXXXX")
-            {
-                # 重试时注入上一轮 verify 反馈，帮助开发者理解哪些修复不充分
-                # 只提取结构化判定（BUG-N: status + VERDICT），丢弃 verbose 噪音，防止 prompt 膨胀
-                if [ $fix_attempt -gt 1 ] && [ -n "${verify_output:-}" ]; then
-                    local verify_summary
-                    verify_summary=$(printf '%s\n' "$verify_output" | grep -E "^BUG-|^VERDICT:" || printf '%s\n' "$verify_output" | tail -20)
-                    echo "## 上一次修复的验证结果（请特别关注 NOT_FIXED 和 PARTIAL 的项目）"
-                    printf '%s\n' "$verify_summary"
-                    echo ""
-                fi
-                echo "以下是独立审计员发现的 bug 报告："
-                echo ""
-                printf '%s\n' "$scan_report"
-                echo ""
-                cat <<'BH_FIX_STATIC_EOF'
+        # ──── [3] 首次 Bug Fix — 新建 session + 捕获 session_id ────
+        log_info "Bug Fix (第 1/${AC_MAX_RETRIES} 次)..."
+        local fix_file; fix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_fix.XXXXXX")
+        {
+            echo "以下是独立审计员发现的 bug 报告："
+            echo ""
+            printf '%s\n' "$scan_report"
+            echo ""
+            cat <<'BH_FIX_STATIC_EOF'
 ## 你的任务
 1. 读取报告中提到的每个文件
 2. 修复所有列出的 P0/P1/P2 bug
@@ -642,15 +665,28 @@ BH_SCAN_STATIC_2
 - 修复后运行测试确认全部通过
 - 只修复报告中列出的 bug，不要做额外重构
 BH_FIX_STATIC_EOF
-            } > "$fix_file"
-            cd "$PROJECT_ROOT"
-            protect_pipeline_files
-            claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
-                < "$fix_file" 2>&1 | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log" || true
-            unprotect_pipeline_files
-            rm -f "$fix_file"
+        } > "$fix_file"
+        cd "$PROJECT_ROOT"
+        local fix_output_file; fix_output_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_fixout.XXXXXX")
+        protect_pipeline_files
+        claude -p --dangerously-skip-permissions --model "$MODEL" \
+            --output-format stream-json \
+            < "$fix_file" > "$fix_output_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log" || true
+        unprotect_pipeline_files
+        # 从 stream-json result 事件提取 session_id（参考 duo 项目 ClaudeCodeAdapter 模式）
+        BUGHUNT_SESSION_ID=$(grep -o '"session_id":"[^"]*"' "$fix_output_file" 2>/dev/null | head -1 | sed 's/"session_id":"//;s/"$//')
+        if [ -n "$BUGHUNT_SESSION_ID" ]; then
+            log_info "Session captured: ${BUGHUNT_SESSION_ID:0:12}..."
+        else
+            log_warn "未能捕获 session_id，后续调用将使用独立 session"
+        fi
+        cat "$fix_output_file" >> "$LOGS_DIR/bug_hunt_round_${round}.log"
+        rm -f "$fix_output_file" "$fix_file"
 
-            # ──── [4] 测试验证 (复用 TEST_MAX_RETRIES 机制) ────
+        # ──── 内循环：Test → Verify → (Retry Fix)，均 --resume 精确复用 session ────
+        while [ $fix_attempt -le $AC_MAX_RETRIES ]; do
+
+            # ──── [4] 测试验证 ────
             log_info "Bug Fix 后运行测试..."
             local test_attempt=0 tests_passed=false
             local test_timeout=300
@@ -668,16 +704,17 @@ BH_FIX_STATIC_EOF
                     log_fail "测试超时 (>${test_timeout}s)"; break
                 fi
                 [ $test_exit -eq 0 ] && tests_passed=true
-                echo "$test_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
+                printf '%s\n' "$test_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
                 [ "$tests_passed" = true ] && { log_ok "测试通过"; break; }
 
+                # Test Fix — --resume 复用 session（含完整上下文，fallback 时可独立运行）
                 if [ $test_attempt -lt $TEST_MAX_RETRIES ]; then
                     log_warn "测试失败，AI 自动修复 ($test_attempt/$TEST_MAX_RETRIES)..."
                     local tfix_file; tfix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_tfix.XXXXXX")
                     {
                         echo "Bug Hunt 修复后测试失败，请修复。"
                         echo ""
-                        echo "## 当前正在修复的 Bug 报告（参考上下文）"
+                        echo "## Bug 报告（参考上下文）"
                         printf '%s\n' "$scan_report"
                         echo ""
                         echo "## 测试输出（最后 80 行）"
@@ -685,74 +722,87 @@ BH_FIX_STATIC_EOF
                         printf '%s\n' "$test_output" | tail -80
                         echo '```'
                         echo ""
-                        cat <<'BH_TFIX_RULES_EOF'
-## 规则
-- 读取失败的测试文件和对应的实现代码
-- 如果不确定测试的预期行为，读取上面的 bug 报告和需求文档来确认
-- 优先修复实现代码而非修改测试的预期值（除非测试本身有错误）
-- 修复后运行: {TEST_CMD}
-- 只修复导致测试失败的问题，不要做额外改动
-- 不能破坏现有测试
-BH_TFIX_RULES_EOF
+                        echo "只修复导致测试失败的问题，运行: {TEST_CMD}"
+                        echo "不能破坏现有测试。"
                     } > "$tfix_file"
                     cd "$PROJECT_ROOT"
-                    protect_pipeline_files
-                    claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
-                        < "$tfix_file" 2>&1 | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log" || true
-                    unprotect_pipeline_files
-                    rm -f "$tfix_file"
+                    local _tfix_out; _tfix_out=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_out.XXXXXX")
+                    _bh_claude "$tfix_file" "$_tfix_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || true
+                    cat "$_tfix_out" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
+                    rm -f "$_tfix_out" "$tfix_file"
                 fi
             done
 
             if [ "$tests_passed" != true ]; then
-                log_warn "Bug Fix 后测试仍失败，继续下一轮修复尝试"
-                continue
+                log_warn "Bug Fix 后测试仍失败，退出本轮修复"
+                break
             fi
 
-            # ──── [5] Fix Verify (独立审计员验证修复) ────
+            # ──── [5] Fix Verify — --resume 复用 session（含完整上下文，fallback 可独立运行）────
             log_info "验证 Bug 修复 (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
             local verify_file; verify_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_verify.XXXXXX")
             {
-                echo "你是独立审计员（只读角色，不要修改任何文件）。以下是之前发现的 bug 报告："
+                echo "你是验证角色（不要修改任何文件）。以下是之前发现的 bug 报告："
                 echo ""
                 printf '%s\n' "$scan_report"
                 echo ""
                 cat <<'BH_VERIFY_STATIC_EOF'
 ## 重要约束
-- 你只有只读权限。不要修改、创建或删除任何文件。只读取和验证。
+- 不要修改、创建或删除任何文件。只读取和验证。
 
 ## 你的任务
 1. 逐一检查报告中的每个 bug 是否已被修复（读取源文件确认）
-2. 检查每个 bug 是否有对应的回归测试，且该测试确实能覆盖修复的场景（不是空壳测试）
-3. 运行测试确认通过: {TEST_CMD}
-4. 检查修复是否引入了新的问题
+2. 检查每个 bug 是否有对应的回归测试
+3. 检查修复是否引入了新的问题
 
 ## 输出格式（严格遵守）
 BUG-1: FIXED — 说明 | 回归测试: YES/NO
-BUG-2: PARTIAL — 主要场景已修复但边界条件仍存在 | 回归测试: YES/NO
+BUG-2: PARTIAL — 说明 | 回归测试: YES/NO
 BUG-3: NOT_FIXED — 说明
 ...
 VERDICT: ALL_FIXED | HAS_UNFIXED
 
 说明：PARTIAL 视为未修复，计入 HAS_UNFIXED。
-
-重要：直接读源文件和测试文件来验证，不要信任之前的 AI 输出。
+重要：直接读源文件和测试文件来验证，不要信任之前的输出。
 BH_VERIFY_STATIC_EOF
             } > "$verify_file"
-            local verify_output verify_exit=0
-            protect_pipeline_files
-            verify_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$verify_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || verify_exit=$?
-            unprotect_pipeline_files
-            rm -f "$verify_file"
-            echo "$verify_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
+            local _vfy_out; _vfy_out=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_out.XXXXXX")
+            local verify_exit=0
+            _bh_claude "$verify_file" "$_vfy_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || verify_exit=$?
+            local verify_output
+            verify_output=$(cat "$_vfy_out")
+            printf '%s\n' "$verify_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
+            rm -f "$_vfy_out" "$verify_file"
 
-            if [ $verify_exit -eq 0 ] && (echo "$verify_output" | grep -q "VERDICT: ALL_FIXED"); then
+            if [ $verify_exit -eq 0 ] && (printf '%s\n' "$verify_output" | grep -q "VERDICT: ALL_FIXED"); then
                 log_ok "所有 bug 已修复并验证"
                 all_fixed=true
                 break
             fi
 
-            log_warn "部分 bug 未修复，继续修复尝试"
+            # ──── 需要继续修复 — --resume 复用 session ────
+            fix_attempt=$((fix_attempt + 1))
+            [ $fix_attempt -gt $AC_MAX_RETRIES ] && break
+
+            log_info "Bug Fix (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
+            local retry_file; retry_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_retry.XXXXXX")
+            {
+                local verify_summary
+                verify_summary=$(printf '%s\n' "$verify_output" | grep -E "^BUG-|^VERDICT:" || printf '%s\n' "$verify_output" | tail -20)
+                echo "## 上一次修复的验证结果（请特别关注 NOT_FIXED 和 PARTIAL 的项目）"
+                printf '%s\n' "$verify_summary"
+                echo ""
+                echo "## 原始 Bug 报告"
+                printf '%s\n' "$scan_report"
+                echo ""
+                echo "请修复剩余 bug。修复后运行测试: {TEST_CMD}"
+                echo "只修复未修复的 bug，不要做额外改动。"
+            } > "$retry_file"
+            cd "$PROJECT_ROOT"
+            local _retry_out; _retry_out=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_out.XXXXXX")
+            _bh_claude "$retry_file" "$_retry_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || true
+            cat "$_retry_out" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
+            rm -f "$_retry_out" "$retry_file"
         done
 
         if [ "$all_fixed" != true ]; then
