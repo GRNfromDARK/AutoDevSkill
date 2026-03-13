@@ -778,10 +778,14 @@ BH_FIX_STATIC_EOF
 BUG-1: FIXED — 说明 | 回归测试: YES/NO
 BUG-2: PARTIAL — 说明 | 回归测试: YES/NO
 BUG-3: NOT_FIXED — 说明
+BUG-4: NOT_FIXED_INVALID — bug 报告描述与当前代码不符（已在之前轮次修复或为误报）
 ...
-VERDICT: ALL_FIXED | HAS_UNFIXED
+VERDICT: ALL_FIXED | HAS_UNFIXED | ALL_INVALID
 
-说明：PARTIAL 视为未修复，计入 HAS_UNFIXED。
+说明：
+- PARTIAL 视为未修复，计入 HAS_UNFIXED。
+- NOT_FIXED_INVALID 表示 bug 报告描述的问题在当前代码中不存在（已修复或误报），全部为此状态时输出 ALL_INVALID。
+- ALL_INVALID 等价于 ALL_FIXED（问题已不存在）。
 重要：直接读源文件和测试文件来验证，不要信任之前的输出。
 BH_VERIFY_STATIC_EOF
             } > "$verify_file"
@@ -793,8 +797,8 @@ BH_VERIFY_STATIC_EOF
             printf '%s\n' "$verify_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
             rm -f "$_vfy_out" "$verify_file"
 
-            if [ $verify_exit -eq 0 ] && (printf '%s\n' "$verify_output" | grep -q "VERDICT: ALL_FIXED"); then
-                log_ok "所有 bug 已修复并验证"
+            if [ $verify_exit -eq 0 ] && (printf '%s\n' "$verify_output" | grep -qE "VERDICT: (ALL_FIXED|ALL_INVALID)"); then
+                log_ok "所有 bug 已修复并验证（或报告与当前代码不符）"
                 all_fixed=true
                 break
             fi
