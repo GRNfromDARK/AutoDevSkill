@@ -689,7 +689,7 @@ BH_FIX_STATIC_EOF
         local fix_output_file; fix_output_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_fixout.XXXXXX")
         protect_pipeline_files
         claude -p --dangerously-skip-permissions --model "$MODEL" \
-            --output-format stream-json \
+            --output-format stream-json --verbose \
             < "$fix_file" > "$fix_output_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log" || true
         unprotect_pipeline_files
         # 从 stream-json result 事件提取 session_id（参考 duo 项目 ClaudeCodeAdapter 模式）
