@@ -206,9 +206,9 @@ execute_card() {
             {
                 echo "Card $card_id 执行后测试失败，请修复。"
                 echo ""
-                echo "## 测试输出"
+                echo "## 测试输出（最后 80 行）"
                 echo '```'
-                printf '%s\n' "$test_output"
+                printf '%s\n' "$test_output" | tail -80
                 echo '```'
                 echo ""
                 cat <<'FIX_RULES_EOF'
@@ -579,7 +579,12 @@ BH_SCAN_STATIC_2
         local scan_output scan_exit=0
         scan_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$scan_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || scan_exit=$?
         rm -f "$scan_file"
-        printf '%s\n' "$scan_output" > "$report_file"
+        # 提取结构化报告（从首个 BUG 标题或 VERDICT 行到末尾），丢弃 --verbose 工具调用日志
+        # scan_output 保留完整输出用于 VERDICT 检查，scan_report 用于注入后续 prompt
+        local scan_report
+        scan_report=$(printf '%s\n' "$scan_output" | sed -n '/^#\{1,3\} *BUG-\|^VERDICT:/,$p')
+        [ -z "$scan_report" ] && scan_report=$(printf '%s\n' "$scan_output" | tail -60)
+        printf '%s\n' "$scan_report" > "$report_file"
         log_ok "Bug 报告已保存: $report_file"
 
         # ──── [2] 判断：有 P0/P1/P2？ ────
@@ -619,7 +624,7 @@ BH_SCAN_STATIC_2
                 fi
                 echo "以下是独立审计员发现的 bug 报告："
                 echo ""
-                printf '%s\n' "$scan_output"
+                printf '%s\n' "$scan_report"
                 echo ""
                 cat <<'BH_FIX_STATIC_EOF'
 ## 你的任务
@@ -673,11 +678,11 @@ BH_FIX_STATIC_EOF
                         echo "Bug Hunt 修复后测试失败，请修复。"
                         echo ""
                         echo "## 当前正在修复的 Bug 报告（参考上下文）"
-                        printf '%s\n' "$scan_output"
+                        printf '%s\n' "$scan_report"
                         echo ""
-                        echo "## 测试输出"
+                        echo "## 测试输出（最后 80 行）"
                         echo '```'
-                        printf '%s\n' "$test_output"
+                        printf '%s\n' "$test_output" | tail -80
                         echo '```'
                         echo ""
                         cat <<'BH_TFIX_RULES_EOF'
@@ -710,7 +715,7 @@ BH_TFIX_RULES_EOF
             {
                 echo "你是独立审计员（只读角色，不要修改任何文件）。以下是之前发现的 bug 报告："
                 echo ""
-                printf '%s\n' "$scan_output"
+                printf '%s\n' "$scan_report"
                 echo ""
                 cat <<'BH_VERIFY_STATIC_EOF'
 ## 重要约束
