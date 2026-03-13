@@ -16,5 +16,35 @@
    - 跨文件变更是否有对应 AI-REVIEW 记录
    - SPEC-DECISION 的残余风险是否合理
    - 统计本 Phase 决策分布（SPEC-DECISION vs AI-REVIEW, BLOCK/WARN/SUGGEST）
-6. 输出审计报告（通过项 / P0-P2 问题 / 决策审计摘要 / 结论）
+6. 输出审计报告
+
+## 输出格式（严格遵守）
+
+最后一行**必须**是 `GATE_VERDICT: PASS` 或 `GATE_VERDICT: FAIL`，这是 autodev.sh 的硬性检查点。
+
+```
+## Phase X 审计报告
+
+### 通过项
+- ✅ ...
+
+### 问题 (P0-P2)
+- ❌ P0: ...
+- ⚠️ P1: ...
+
+### 决策审计摘要
+- SPEC-DECISION: N 条
+- AI-REVIEW: N 条
+- BLOCK: N (全部已共识: YES/NO)
+
+### 结论
+（附原因说明）
+
+GATE_VERDICT: PASS
+```
+
+如果存在未解决的 P0 问题，最后一行改为：
+```
+GATE_VERDICT: FAIL
+```
 ```

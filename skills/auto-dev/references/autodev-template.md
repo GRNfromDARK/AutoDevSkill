@@ -351,7 +351,7 @@ run_phase_gate() {
         [ "$gate_passed" != true ] && { log_fail "门禁经 $GATE_MAX_RETRIES 次修复仍未通过"; return 1; }
     fi
 
-    # 2. AI 审计 (phase_gate.md)
+    # 2. AI 审计 (phase_gate.md) — 检查 GATE_VERDICT 哨兵
     log_info "运行 AI 审计..."
     local gate_audit_file; gate_audit_file=$(mktemp "${TMPDIR:-/tmp}/autodev_audit.XXXXXX")
     {
@@ -362,12 +362,24 @@ run_phase_gate() {
         echo "已完成的 Card:"
         grep "^CARD:" "$STATE_FILE" 2>/dev/null | sed 's/^CARD:/- /' || echo "（无）"
     } > "$gate_audit_file"
+    local gate_audit_out; gate_audit_out=$(mktemp "${TMPDIR:-/tmp}/autodev_auditout.XXXXXX")
     protect_pipeline_files
     claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
-        < "$gate_audit_file" 2>&1 | tee -a "$log_file" || true
+        < "$gate_audit_file" > "$gate_audit_out" 2>>"$log_file" || true
     unprotect_pipeline_files
+    cat "$gate_audit_out" >> "$log_file"
     rm -f "$gate_audit_file"
-    log_ok "Phase Gate $phase 完成"
+    if grep -q "GATE_VERDICT: PASS" "$gate_audit_out"; then
+        log_ok "AI 审计通过 (GATE_VERDICT: PASS)"
+    elif grep -q "GATE_VERDICT: FAIL" "$gate_audit_out"; then
+        log_fail "AI 审计未通过 (GATE_VERDICT: FAIL)"
+        cat "$gate_audit_out"
+        rm -f "$gate_audit_out"
+        return 1
+    else
+        log_warn "AI 审计未输出 GATE_VERDICT 哨兵，视为通过（请检查日志）"
+    fi
+    rm -f "$gate_audit_out"
 
     # 3. 更新 Phase 基线（供下一阶段 phase-scoped diff）
     git rev-parse HEAD > "$PHASE_BASELINE_FILE" 2>/dev/null || true

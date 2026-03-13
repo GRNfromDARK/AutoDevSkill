@@ -199,7 +199,8 @@ After generating all files:
 7. Verify decisions.jsonl exists and is empty: `test -f decisions.jsonl && [ ! -s decisions.jsonl ]`
 8. Verify summary.md does NOT exist yet (it's auto-generated at runtime)
 9. Verify generated files contain no unresolved placeholders/stubs:
-   - `! rg -n '\{(PROJECT|SPEC|TODOLIST|TEST_CMD|ALL_STEPS_CONTENT|FIRST_CARD_ID|SOURCE_DIRS|AUTODEV_PATH|AUTODEV_DIR|ENV_PREFIX|ADDITIONAL_FILES|RELEVANT|EXISTING_FILES|ACCEPTANCE_CRITERION|CARD_TITLE|CARD_ID|REVIEWER_ROLE|TASKS_WITH)[^}]*\}' autodev.sh gate_check.sh system_prompt.md cards/*.md`
+   - `! rg -n '\{(PROJECT|SPEC|TODOLIST|TEST_CMD|ALL_STEPS_CONTENT|FIRST_CARD_ID|SOURCE_DIRS|AUTODEV_PATH|AUTODEV_DIR|ENV_PREFIX|ADDITIONAL_FILES|RELEVANT|EXISTING_FILES|ACCEPTANCE_CRITERION|CARD_TITLE|CARD_ID|ALLOWED_PATHS|FORBIDDEN_PATHS|TASKS_WITH)[^}]*\}' autodev.sh gate_check.sh system_prompt.md cards/*.md`
+   - Note: `{REVIEWER_ROLE}` in system_prompt.md is a **runtime placeholder** (filled by AI during AI-REVIEW execution), not a generation-time placeholder — do NOT flag it.
    - `! rg -n 'show_help\(\) \{ \.\.\. \}|show_status\(\) \{ \.\.\. \}' autodev.sh`
 
 ## Key Principles

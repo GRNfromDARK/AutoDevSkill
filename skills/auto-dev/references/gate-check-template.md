@@ -71,8 +71,39 @@ else
     check_pass "AI-REVIEW 覆盖率正常 ($changed_files 文件变更, 本 Phase $phase_review_count 处 AI-REVIEW 标注)"
 fi
 
+# ──── 路径边界检查 ────
+# 检查是否有越界修改（只允许修改 {ALLOWED_PATHS} 下的文件）
+# 生成时请将 {ALLOWED_PATHS} 替换为允许修改的目录列表（空格分隔），
+# 将 {FORBIDDEN_PATHS} 替换为禁止修改的文件/目录列表（空格分隔），
+# 如果项目不需要路径限制，删除此段。
+ALLOWED_PATHS="{ALLOWED_PATHS}"
+FORBIDDEN_PATHS="{FORBIDDEN_PATHS}"
+if [ -n "$ALLOWED_PATHS" ] && [ "$ALLOWED_PATHS" != "{""ALLOWED_PATHS""}" ]; then
+    echo ""
+    echo "── 路径边界检查 ──"
+    boundary_ok=true
+    while IFS= read -r changed_file; do
+        in_scope=false
+        for allowed in $ALLOWED_PATHS; do
+            case "$changed_file" in "$allowed"*) in_scope=true; break ;; esac
+        done
+        if [ "$in_scope" != true ]; then
+            check_fail "越界修改: $changed_file (不在允许范围 [$ALLOWED_PATHS] 内)"
+            boundary_ok=false
+        fi
+    done < <(git diff --name-only "${phase_base_ref:-HEAD~1}" -- 2>/dev/null)
+    [ "$boundary_ok" = true ] && check_pass "所有变更文件在允许路径范围内"
+fi
+if [ -n "$FORBIDDEN_PATHS" ] && [ "$FORBIDDEN_PATHS" != "{""FORBIDDEN_PATHS""}" ]; then
+    for forbidden in $FORBIDDEN_PATHS; do
+        if git diff --name-only "${phase_base_ref:-HEAD~1}" -- 2>/dev/null | grep -q "^${forbidden}"; then
+            check_fail "禁止修改的路径被改动: $forbidden"
+        fi
+    done
+fi
+
 # ──── 项目特定检查 (定制) ────
-# 6-N. {PROJECT_SPECIFIC_CHECKS}
+# {PROJECT_SPECIFIC_CHECKS}
 
 # ──── 汇总 ────
 echo ""

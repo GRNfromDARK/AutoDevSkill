@@ -127,6 +127,14 @@ AutoDevSkill/
 
 ## Changelog
 
+### v1.6 (2026-03-13)
+
+- **Fix**: Gate audit now checks `GATE_VERDICT: PASS/FAIL` sentinel from AI auditor output; previously gate audit always passed regardless of auditor's conclusion
+- **Fix**: `phase-gate-template.md` now includes explicit VERDICT output format with `GATE_VERDICT: PASS` / `GATE_VERDICT: FAIL` sentinel requirement
+- **Feature**: `gate-check-template.md` adds path boundary enforcement — `{ALLOWED_PATHS}` whitelist and `{FORBIDDEN_PATHS}` blacklist prevent out-of-scope file modifications from passing gate checks
+- **Fix**: SKILL.md verification regex no longer flags `{REVIEWER_ROLE}` (runtime placeholder in AI-REVIEW example, not a generation-time placeholder)
+- **Feature**: Bug Hunt P3 severity tier (record-only, no fix required) — auditor can classify minor style/naming issues as P3 without triggering fix loop
+
 ### v1.5 (2026-03-13)
 
 - **Feature**: Bug Hunt session reuse — within each Bug Hunt round, Fix/TestFix/Verify/Retry calls reuse the same Claude session via `--resume <session_id>`, eliminating redundant file reading (~60-70% of per-round token cost). First Bug Fix captures session_id from `--output-format stream-json`; subsequent calls use `_bh_claude()` helper with automatic fallback to new session on resume failure.
