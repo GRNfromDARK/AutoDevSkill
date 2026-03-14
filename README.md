@@ -127,6 +127,13 @@ AutoDevSkill/
 
 ## Changelog
 
+### v1.7 (2026-03-14)
+
+- **Fix**: Bug report truncation — `--verbose` flag on Bug Scan polluted stdout with ANSI escape codes / tool call logs, causing `sed` `^` anchor to fail; all reports fell back to `tail -60`, cutting off the first 1-2 bugs. Fixed by removing `--verbose` from all non-stream-json commands and adding ANSI strip as safety net. Fallback increased to `tail -200`.
+- **Optimization**: Dual-prompt session reuse — `_bh_claude()` now accepts separate resume prompt (lean, no repeated context) and fallback prompt (full, standalone). When `--resume` succeeds, `scan_report` is NOT re-injected (already in session context), saving ~2-5K tokens per resumed call.
+- **Optimization**: 3-tier model allocation — `LIGHT_MODEL` (default: sonnet) for verification/summary tasks that check against explicit criteria (AC verify, Gate audit, Fix Verify, Pipeline Summary, Bug Hunt Summary). `MODEL` (opus) for code writing/fixing. `VERIFY_MODEL` (opus) for Bug Scan (finding novel bugs).
+- **Config**: New env var `{ENV_PREFIX}_LIGHT_MODEL` (default: `sonnet`) for lightweight tasks.
+
 ### v1.6 (2026-03-13)
 
 - **Fix**: Gate audit now checks `GATE_VERDICT: PASS/FAIL` sentinel from AI auditor output; previously gate audit always passed regardless of auditor's conclusion
@@ -268,14 +275,14 @@ pytest tests/ -q
 所有 Card 完成 → summary.md → Bug Hunt 多轮循环 → 最终交付
 ```
 
-| 步骤 | 角色 | 说明 |
-|------|------|------|
-| Bug Scan | 独立审计员（只读） | 扫描代码 + 对照需求，找出 P0/P1/P2 bug |
-| Bug Fix | 开发者 AI | 修复 bug + 编写回归测试 |
-| 测试验证 | 自动 | 运行全量测试，失败自动修复 |
-| Fix Verify | 独立审计员（只读） | 验证修复 + 检查回归测试质量 |
+| 步骤 | 角色 | 模型 | 说明 |
+|------|------|------|------|
+| Bug Scan | 独立审计员（只读） | opus | 扫描代码 + 对照需求，找出 P0/P1/P2 bug |
+| Bug Fix | 开发者 AI | opus | 修复 bug + 编写回归测试 |
+| 测试验证 | 自动 | — | 运行全量测试，失败自动修复 (opus) |
+| Fix Verify | 独立审计员（只读） | sonnet | 对照 bug 报告验证修复结果 |
 
 - 无新 bug → 退出循环
 - 默认最多 15 轮（`{ENV_PREFIX}_BUG_HUNT_ROUNDS`）
 - 支持断点续跑（crash 后从上次完成的轮次继续）
-- 同一轮内复用 Claude session（`--resume`），大幅减少重复文件读取的 token 消耗
+- 同一轮内复用 Claude session（`--resume`），精简 prompt 不重复注入已有上下文

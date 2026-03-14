@@ -37,8 +37,9 @@ else
 fi
 
 # ──── 配置 ────
-MODEL="${{ENV_PREFIX}_MODEL:-opus}"
-VERIFY_MODEL="${{ENV_PREFIX}_VERIFY_MODEL:-opus}"   # 验收验证模型
+MODEL="${{ENV_PREFIX}_MODEL:-opus}"                  # 实现 & 修复（Bug Fix / Test Fix / Retry Fix）
+VERIFY_MODEL="${{ENV_PREFIX}_VERIFY_MODEL:-opus}"    # 审计 & 扫描（Bug Scan / AC 验证）
+LIGHT_MODEL="${{ENV_PREFIX}_LIGHT_MODEL:-sonnet}"    # 轻量任务（Fix Verify / Summary）
 CARD_TIMEOUT="${{ENV_PREFIX}_TIMEOUT:-900}"
 GATE_MAX_RETRIES="${{ENV_PREFIX}_GATE_RETRIES:-10}"
 TEST_MAX_RETRIES="${{ENV_PREFIX}_TEST_RETRIES:-10}"   # 测试自动修复最多重试次数
@@ -260,9 +261,11 @@ VERIFY_STATIC_EOF
         } > "$ac_file"
         local verify_output verify_exit=0
         protect_pipeline_files
-        verify_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$ac_file" 2>&1) || verify_exit=$?
+        verify_output=$(claude -p --dangerously-skip-permissions --model "$LIGHT_MODEL" < "$ac_file" 2>&1) || verify_exit=$?
         unprotect_pipeline_files
         rm -f "$ac_file"
+        # 清理 ANSI 转义码，确保 grep 锚点匹配
+        verify_output=$(printf '%s\n' "$verify_output" | sed 's/\x1b\[[0-9;]*m//g')
         echo "$verify_output" | tee -a "$log_file"
 
         if [ $verify_exit -eq 0 ] && (echo "$verify_output" | grep -q "VERDICT: ALL_PASS"); then
@@ -364,7 +367,7 @@ run_phase_gate() {
     } > "$gate_audit_file"
     local gate_audit_out; gate_audit_out=$(mktemp "${TMPDIR:-/tmp}/autodev_auditout.XXXXXX")
     protect_pipeline_files
-    claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
+    claude -p --dangerously-skip-permissions --model "$LIGHT_MODEL" --verbose \
         < "$gate_audit_file" > "$gate_audit_out" 2>>"$log_file" || true
     unprotect_pipeline_files
     cat "$gate_audit_out" >> "$log_file"
@@ -467,7 +470,7 @@ SUMMARY_STATIC_2
     } > "$summary_file_prompt"
 
     local summary_output
-    summary_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$summary_file_prompt" 2>&1) || true
+    summary_output=$(claude -p --dangerously-skip-permissions --model "$LIGHT_MODEL" < "$summary_file_prompt" 2>&1) || true
     rm -f "$summary_file_prompt"
 
     # 提取 Markdown 内容写入文件
@@ -484,31 +487,34 @@ SUMMARY_STATIC_2
     echo ""
 }
 
-# ──── Bug Hunt: session 恢复 helper ────
-# 带 session resume + fallback 的 claude 调用。
-# 用法: _bh_claude <prompt_file> <output_file> <log_file>
-# 如果 BUGHUNT_SESSION_ID 非空 → 尝试 --resume；失败 → 清除 ID，回退到新 session。
-# 输出写入 output_file，stderr 追加到 log_file。调用方自行决定如何处理 output_file。
+# ──── Bug Hunt: session 恢复 helper（双 prompt 模式）────
+# 用法: _bh_claude <resume_prompt> <fallback_prompt> <output_file> <log_file> [model]
+# resume_prompt:   精简 prompt（--resume 时使用，不含 session 中已有的重复上下文）
+# fallback_prompt: 完整 prompt（新 session 时使用，含全部上下文可独立运行）
+# model:           可选，fallback 新 session 使用的模型（默认 $MODEL）
+# 如果 BUGHUNT_SESSION_ID 非空 → 用 resume_prompt + --resume；失败 → 用 fallback_prompt 新建 session。
 _bh_claude() {
-    local prompt_file="$1"
-    local output_file="$2"
-    local log_file="$3"
+    local resume_prompt="$1"
+    local fallback_prompt="$2"
+    local output_file="$3"
+    local log_file="$4"
+    local use_model="${5:-$MODEL}"
     local _exit=0
 
     protect_pipeline_files
     if [ -n "$BUGHUNT_SESSION_ID" ]; then
-        claude -p --resume "$BUGHUNT_SESSION_ID" --dangerously-skip-permissions --verbose \
-            < "$prompt_file" > "$output_file" 2>>"$log_file" || _exit=$?
+        claude -p --resume "$BUGHUNT_SESSION_ID" --dangerously-skip-permissions \
+            < "$resume_prompt" > "$output_file" 2>>"$log_file" || _exit=$?
         if [ $_exit -ne 0 ]; then
-            log_warn "Session resume 失败 (exit: $_exit)，回退到新 session"
+            log_warn "Session resume 失败 (exit: $_exit)，回退到新 session（完整上下文）"
             BUGHUNT_SESSION_ID=""
             _exit=0
-            claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
-                < "$prompt_file" > "$output_file" 2>>"$log_file" || _exit=$?
+            claude -p --dangerously-skip-permissions --model "$use_model" \
+                < "$fallback_prompt" > "$output_file" 2>>"$log_file" || _exit=$?
         fi
     else
-        claude -p --dangerously-skip-permissions --model "$MODEL" --verbose \
-            < "$prompt_file" > "$output_file" 2>>"$log_file" || _exit=$?
+        claude -p --dangerously-skip-permissions --model "$use_model" \
+            < "$fallback_prompt" > "$output_file" 2>>"$log_file" || _exit=$?
     fi
     unprotect_pipeline_files
     return $_exit
@@ -625,13 +631,15 @@ BH_SCAN_STATIC_2
 
         log_info "Bug Scan 中 (VERIFY_MODEL: $VERIFY_MODEL)..."
         local scan_output scan_exit=0
-        scan_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$scan_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || scan_exit=$?
+        # Bug Scan 不使用 --verbose：避免 ANSI 转义码/工具日志污染 stdout，确保纯文本输出
+        scan_output=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" < "$scan_file" 2>>"$LOGS_DIR/bug_hunt_round_${round}.log") || scan_exit=$?
         rm -f "$scan_file"
-        # 提取结构化报告（从首个 BUG 标题或 VERDICT 行到末尾），丢弃 --verbose 工具调用日志
-        # scan_output 保留完整输出用于 VERDICT 检查，scan_report 用于注入后续 prompt
+        # 清理可能残留的 ANSI 转义码，确保 sed 锚点匹配
+        scan_output=$(printf '%s\n' "$scan_output" | sed 's/\x1b\[[0-9;]*m//g')
+        # 提取结构化报告（从首个 BUG 标题或 VERDICT 行到末尾）
         local scan_report
         scan_report=$(printf '%s\n' "$scan_output" | sed -n '/^#\{1,3\} *BUG-\|^VERDICT:/,$p')
-        [ -z "$scan_report" ] && scan_report=$(printf '%s\n' "$scan_output" | tail -60)
+        [ -z "$scan_report" ] && scan_report=$(printf '%s\n' "$scan_output" | tail -200)
         printf '%s\n' "$scan_report" > "$report_file"
         log_ok "Bug 报告已保存: $report_file"
 
@@ -726,10 +734,24 @@ BH_FIX_STATIC_EOF
                 printf '%s\n' "$test_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
                 [ "$tests_passed" = true ] && { log_ok "测试通过"; break; }
 
-                # Test Fix — --resume 复用 session（含完整上下文，fallback 时可独立运行）
+                # Test Fix — 双 prompt: resume 精简 / fallback 完整
                 if [ $test_attempt -lt $TEST_MAX_RETRIES ]; then
                     log_warn "测试失败，AI 自动修复 ($test_attempt/$TEST_MAX_RETRIES)..."
-                    local tfix_file; tfix_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_tfix.XXXXXX")
+                    # resume prompt（精简）：session 已有 bug 报告上下文，只注入新数据
+                    local tfix_resume; tfix_resume=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_tfix_r.XXXXXX")
+                    {
+                        echo "Bug Hunt 修复后测试失败，请修复（bug 报告已在之前对话中）。"
+                        echo ""
+                        echo "## 测试输出（最后 80 行）"
+                        echo '```'
+                        printf '%s\n' "$test_output" | tail -80
+                        echo '```'
+                        echo ""
+                        echo "只修复导致测试失败的问题，运行: {TEST_CMD}"
+                        echo "不能破坏现有测试。"
+                    } > "$tfix_resume"
+                    # fallback prompt（完整）：含 bug 报告，可独立运行
+                    local tfix_full; tfix_full=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_tfix_f.XXXXXX")
                     {
                         echo "Bug Hunt 修复后测试失败，请修复。"
                         echo ""
@@ -743,12 +765,12 @@ BH_FIX_STATIC_EOF
                         echo ""
                         echo "只修复导致测试失败的问题，运行: {TEST_CMD}"
                         echo "不能破坏现有测试。"
-                    } > "$tfix_file"
+                    } > "$tfix_full"
                     cd "$PROJECT_ROOT"
                     local _tfix_out; _tfix_out=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_out.XXXXXX")
-                    _bh_claude "$tfix_file" "$_tfix_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || true
+                    _bh_claude "$tfix_resume" "$tfix_full" "$_tfix_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || true
                     cat "$_tfix_out" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
-                    rm -f "$_tfix_out" "$tfix_file"
+                    rm -f "$_tfix_out" "$tfix_resume" "$tfix_full"
                 fi
             done
 
@@ -757,15 +779,11 @@ BH_FIX_STATIC_EOF
                 break
             fi
 
-            # ──── [5] Fix Verify — --resume 复用 session（含完整上下文，fallback 可独立运行）────
+            # ──── [5] Fix Verify — 双 prompt: resume 精简 / fallback 完整 ────
             log_info "验证 Bug 修复 (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
-            local verify_file; verify_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_verify.XXXXXX")
-            {
-                echo "你是验证角色（不要修改任何文件）。以下是之前发现的 bug 报告："
-                echo ""
-                printf '%s\n' "$scan_report"
-                echo ""
-                cat <<'BH_VERIFY_STATIC_EOF'
+            # 共用的验证指令（heredoc 变量，两份 prompt 共享）
+            local _verify_instructions
+            _verify_instructions=$(cat <<'BH_VERIFY_STATIC_EOF'
 ## 重要约束
 - 不要修改、创建或删除任何文件。只读取和验证。
 
@@ -788,14 +806,30 @@ VERDICT: ALL_FIXED | HAS_UNFIXED | ALL_INVALID
 - ALL_INVALID 等价于 ALL_FIXED（问题已不存在）。
 重要：直接读源文件和测试文件来验证，不要信任之前的输出。
 BH_VERIFY_STATIC_EOF
-            } > "$verify_file"
+)
+            # resume prompt（精简）：session 已有 bug 报告，不重复注入
+            local verify_resume; verify_resume=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_vfy_r.XXXXXX")
+            {
+                echo "你是验证角色（不要修改任何文件）。请验证你之前修复的 bug（bug 报告已在之前对话中）。"
+                echo ""
+                printf '%s\n' "$_verify_instructions"
+            } > "$verify_resume"
+            # fallback prompt（完整）：含 bug 报告，可独立运行
+            local verify_full; verify_full=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_vfy_f.XXXXXX")
+            {
+                echo "你是验证角色（不要修改任何文件）。以下是之前发现的 bug 报告："
+                echo ""
+                printf '%s\n' "$scan_report"
+                echo ""
+                printf '%s\n' "$_verify_instructions"
+            } > "$verify_full"
             local _vfy_out; _vfy_out=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_out.XXXXXX")
             local verify_exit=0
-            _bh_claude "$verify_file" "$_vfy_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || verify_exit=$?
+            _bh_claude "$verify_resume" "$verify_full" "$_vfy_out" "$LOGS_DIR/bug_hunt_round_${round}.log" "$LIGHT_MODEL" || verify_exit=$?
             local verify_output
-            verify_output=$(cat "$_vfy_out")
+            verify_output=$(cat "$_vfy_out" | sed 's/\x1b\[[0-9;]*m//g')
             printf '%s\n' "$verify_output" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
-            rm -f "$_vfy_out" "$verify_file"
+            rm -f "$_vfy_out" "$verify_resume" "$verify_full"
 
             if [ $verify_exit -eq 0 ] && (printf '%s\n' "$verify_output" | grep -qE "VERDICT: (ALL_FIXED|ALL_INVALID)"); then
                 log_ok "所有 bug 已修复并验证（或报告与当前代码不符）"
@@ -803,15 +837,25 @@ BH_VERIFY_STATIC_EOF
                 break
             fi
 
-            # ──── 需要继续修复 — --resume 复用 session ────
+            # ──── 需要继续修复 — 双 prompt: resume 精简 / fallback 完整 ────
             fix_attempt=$((fix_attempt + 1))
             [ $fix_attempt -gt $AC_MAX_RETRIES ] && break
 
             log_info "Bug Fix (第 ${fix_attempt}/${AC_MAX_RETRIES} 次)..."
-            local retry_file; retry_file=$(mktemp "${TMPDIR:-/tmp}/autodev_bughunt_retry.XXXXXX")
+            local verify_summary
+            verify_summary=$(printf '%s\n' "$verify_output" | grep -E "^BUG-|^VERDICT:" || printf '%s\n' "$verify_output" | tail -20)
+            # resume prompt（精简）：session 已有 bug 报告和之前修复上下文，只注入验证结果
+            local retry_resume; retry_resume=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_retry_r.XXXXXX")
             {
-                local verify_summary
-                verify_summary=$(printf '%s\n' "$verify_output" | grep -E "^BUG-|^VERDICT:" || printf '%s\n' "$verify_output" | tail -20)
+                echo "## 上一次修复的验证结果（请特别关注 NOT_FIXED 和 PARTIAL 的项目）"
+                printf '%s\n' "$verify_summary"
+                echo ""
+                echo "请修复剩余 bug（原始 bug 报告已在之前对话中）。修复后运行测试: {TEST_CMD}"
+                echo "只修复未修复的 bug，不要做额外改动。"
+            } > "$retry_resume"
+            # fallback prompt（完整）：含 bug 报告，可独立运行
+            local retry_full; retry_full=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_retry_f.XXXXXX")
+            {
                 echo "## 上一次修复的验证结果（请特别关注 NOT_FIXED 和 PARTIAL 的项目）"
                 printf '%s\n' "$verify_summary"
                 echo ""
@@ -820,12 +864,12 @@ BH_VERIFY_STATIC_EOF
                 echo ""
                 echo "请修复剩余 bug。修复后运行测试: {TEST_CMD}"
                 echo "只修复未修复的 bug，不要做额外改动。"
-            } > "$retry_file"
+            } > "$retry_full"
             cd "$PROJECT_ROOT"
             local _retry_out; _retry_out=$(mktemp "${TMPDIR:-/tmp}/autodev_bh_out.XXXXXX")
-            _bh_claude "$retry_file" "$_retry_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || true
+            _bh_claude "$retry_resume" "$retry_full" "$_retry_out" "$LOGS_DIR/bug_hunt_round_${round}.log" || true
             cat "$_retry_out" | tee -a "$LOGS_DIR/bug_hunt_round_${round}.log"
-            rm -f "$_retry_out" "$retry_file"
+            rm -f "$_retry_out" "$retry_resume" "$retry_full"
         done
 
         if [ "$all_fixed" != true ]; then
@@ -873,7 +917,7 @@ BH_VERIFY_STATIC_EOF
 BH_SUMMARY_STATIC_EOF
     } > "$bh_summary_file"
     local bh_section
-    bh_section=$(claude -p --dangerously-skip-permissions --model "$VERIFY_MODEL" --verbose < "$bh_summary_file" 2>>"$LOGS_DIR/bug_hunt_summary.log") || true
+    bh_section=$(claude -p --dangerously-skip-permissions --model "$LIGHT_MODEL" < "$bh_summary_file" 2>>"$LOGS_DIR/bug_hunt_summary.log") || true
     rm -f "$bh_summary_file"
     { echo ""; printf '%s\n' "$bh_section"; } >> "$SUMMARY_FILE"
     log_ok "summary.md 已更新（追加 Bug Hunt 结果）"
